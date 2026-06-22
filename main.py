@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from zenrows import ZenRowsClient
-
+from processor import process_html
 app = FastAPI()
 
 # إعداد الـ CORS للسماح بالاتصال من FlutterFlow
@@ -26,8 +26,12 @@ async def scrape(request: ScrapeRequest):
     # جلب محتوى الصفحة
     response = client.get(url)
     
+   # معالجة البيانات
+    product_data = process_html(response.text)
+    
     return {
         "status": "success",
         "url": url,
+        "product_info": product_data,
         "content_length": len(response.text)
     }
