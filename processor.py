@@ -1,14 +1,18 @@
+import json
 from bs4 import BeautifulSoup
+import re
 
 def process_html(html_content):
-    soup = BeautifulSoup(html_content, 'html.parser')
+    # البحث عن البيانات المخفية التي تحتوي على اسم المنتج
+    match = re.search(r'window\.runParams\s*=\s*({.*?});', html_content)
     
-    # محاولة إيجاد اسم المنتج
-    title_tag = soup.find('h1', {'data-spm-anchor-id': None}) or soup.find('span', {'class': 'product-title-text'})
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            # استخراج الاسم من البيانات الهيكلية
+            title = data.get('data', {}).get('pageModule', {}).get('title', "لم يتم العثور على اسم المنتج")
+            return {"product_name": title}
+        except:
+            return {"product_name": "خطأ في معالجة البيانات"}
     
-    # استخراج النص إذا وجد التاج، وإلا وضع رسالة خطأ
-    title = title_tag.text.strip() if title_tag else "لم يتم العثور على اسم المنتج"
-    
-    return {
-        "product_name": title
-    }
+    return {"product_name": "لم يتم العثور على اسم المنتج في البيانات الهيكلية"}
