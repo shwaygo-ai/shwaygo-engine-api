@@ -3,24 +3,25 @@ from bs4 import BeautifulSoup
 def process_html(html_content):
     soup = BeautifulSoup(html_content, 'html.parser')
     
-    # 1. الاسم
+    # استخراج الاسم
     title_tag = soup.find('meta', property='og:title')
-    title = title_tag['content'] if title_tag else "لا يوجد اسم"
+    title = title_tag['content'] if title_tag else "لم يتم العثور على الاسم"
     
-    # 2. التقييم (نبحث عن الـ span الذي يحتوي على التقييم)
-    rating_tag = soup.find('span', {'class': 'overview-rating-average'})
-    rating = rating_tag.text.strip() if rating_tag else "لا يوجد تقييم"
+    # استخراج التقييم (نبحث عن أكثر من كلاس محتمل)
+    rating_tag = soup.find('span', {'class': 'overview-rating-average'}) or soup.find('span', {'class': 'rating-value'})
+    rating = rating_tag.text.strip() if rating_tag else "غير متوفر"
     
-    # 3. الوصف (نبحث عن الـ div الخاص بوصف المنتج)
-    desc_tag = soup.find('div', {'id': 'product-description'})
-    description = desc_tag.text.strip() if desc_tag else "لا يوجد وصف"
+    # استخراج الوصف (نبحث عن الـ meta description كخيار مضمون)
+    desc_tag = soup.find('meta', {'name': 'description'}) or soup.find('div', {'id': 'product-description'})
+    description = desc_tag.get('content', '') if desc_tag and desc_tag.name == 'meta' else (desc_tag.text.strip() if desc_tag else "غير متوفر")
     
-    # 4. الصور (نجمع روابط الصور)
-    images = [img['src'] for img in soup.find_all('img', {'class': 'magnifier-image'})]
+    # استخراج الصور (البحث عن صور المنتج في الـ meta image)
+    img_tag = soup.find('meta', property='og:image')
+    images = [img_tag['content']] if img_tag else ["غير متوفر"]
     
     return {
         "product_name": title,
         "product_rating": rating,
         "description": description,
-        "images": images if images else ["لا توجد صور"]
+        "images": images
     }
