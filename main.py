@@ -1,11 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from zenrows import ZenRowsClient
 
 app = FastAPI()
 
-# إعداد الـ CORS للسماح بالاتصال من أي مكان (بما في ذلك FlutterFlow)
+# إعداد الـ CORS للسماح بالاتصال من FlutterFlow
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,26 +14,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# تعريف الهيكل الذي يستقبله السيرفر من FlutterFlow
 class ScrapeRequest(BaseModel):
     url: str
 
-# الـ Endpoint الخاص بالـ Scrape
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
-    # هذه البيانات التجريبية ستظهر في FlutterFlow عند الضغط على Test
+    # الكي الخاص بك مدمج هنا
+    client = ZenRowsClient("c5c1fb32689738572ecce5fbfed1bc58f43e7841")
+    
+    url = request.url
+    # جلب محتوى الصفحة
+    response = client.get(url)
+    
     return {
         "status": "success",
-        "url": request.url,
-        "current_percentage": "90%",
-        "product_rating": 4.8,
-        "description": "هذا وصف تجريبي من محرك ShwayGo",
-        "names": "اسم المنتج التجريبي هنا",
-        "seo_assets": "بيانات الـ SEO",
-        "faq_assets": "بيانات الأسئلة الشائعة",
-        "reviews_assets": "بيانات المراجعات",
-        "features": "قائمة المميزات",
-        "specifications": "المواصفات الفنية",
-        "images": ["image1.jpg", "image2.jpg"],
-        "videos": []
+        "url": url,
+        "content_length": len(response.text)
     }
