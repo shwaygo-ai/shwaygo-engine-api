@@ -1,18 +1,26 @@
-import os
-from zenrows import ZenRowsClient
-from fastapi import FastAPI, Body
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 app = FastAPI()
 
-client = ZenRowsClient(os.getenv("ZENROWS_API_KEY"))
+# 1. إعداد الـ CORS للسماح لـ FlutterFlow بالاتصال
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+class ScrapeRequest(BaseModel):
+    url: str
+
+# 2. تعريف الـ POST Endpoint
 @app.post("/scrape")
-async def scrape_product(data: dict = Body(...)):
-    url = data.get("url")
-    params = {
-        "js_render": "true",
-        "antibot": "true",
-        "premium_proxy": "true"
+async def scrape(request: ScrapeRequest):
+    # هنا ستضع لاحقاً منطق الـ Scrape الخاص بك
+    return {
+        "status": "success",
+        "url": request.url
     }
-    response = client.get(url, params)
-    return {"content": response.text}
