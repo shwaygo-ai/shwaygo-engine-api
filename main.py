@@ -27,8 +27,21 @@ async def scrape(request: ScrapeRequest):
             return {"status": "error", "message": "المفاتيح غير موجودة في الإعدادات"}
 
         genai.configure(api_key=gemini_key)
-        # التحديث هنا: استخدام الاسم التفصيلي الحديث الذي يطلبه سيرفر جوجل
-        model = genai.GenerativeModel('gemini-1.5-pro')
+
+        # === الحل الجذري: البحث التلقائي عن الموديل المسموح لمفتاحك ===
+        valid_model_name = None
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                valid_model_name = m.name.replace('models/', '')
+                # التقاط أي موديل حديث متاح
+                if 'gemini-1.5' in valid_model_name or 'gemini-1.0' in valid_model_name:
+                    break 
+        
+        if not valid_model_name:
+            return {"status": "error", "message": "مفتاحك لا يملك صلاحية الوصول لأي موديل توليد نصوص."}
+
+        model = genai.GenerativeModel(valid_model_name)
+        # ==============================================================
 
         zenrows_params = {
             "apikey": zenrows_key,
@@ -51,6 +64,7 @@ async def scrape(request: ScrapeRequest):
 
         return {
             "status": "success",
+            "used_model": valid_model_name, # سيطبع لك هنا اسم الموديل الذي نجح أخيراً
             "ai_content": ai_response.text
         }
 
