@@ -4,7 +4,15 @@ from pydantic import BaseModel
 from zenrows import ZenRowsClient
 from processor import process_html
 app = FastAPI()
+import google.generativeai as genai
+import os
 
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+def generate_ai_content(product_name):
+    model = genai.GenerativeModel('gemini-pro')
+    prompt = f"اكتب وصفاً تسويقياً جذاباً، 5 مميزات، وكلمات مفتاحية للـ SEO للمنتج التالي: {product_name}"
+    response = model.generate_content(prompt)
+    return response.text
 # إعداد الـ CORS للسماح بالاتصال من FlutterFlow
 app.add_middleware(
     CORSMiddleware,
@@ -28,10 +36,14 @@ async def scrape(request: ScrapeRequest):
     
    # معالجة البيانات
     product_data = process_html(response.text)
-    
-    return {
+    # أضف هذا السطر قبل الـ return
+ai_content = generate_ai_content(product_data.get("product_name", "هذا المنتج"))
+
+return {
         "status": "success",
         "url": url,
         "product_info": product_data,
+        "ai_content": ai_content,
         "content_length": len(response.text)
     }
+   
