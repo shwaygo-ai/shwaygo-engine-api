@@ -7,7 +7,6 @@ import google.generativeai as genai
 
 app = FastAPI()
 
-# 1. بوابة الاتصال لـ FlutterFlow (لحل مشكلة Failed to fetch)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,21 +24,29 @@ async def scrape(request: ScrapeRequest):
         zenrows_key = os.environ.get("ZENROWS_API_KEY")
 
         if not gemini_key or not zenrows_key:
-            return {"status": "error", "message": "المفاتيح غير موجودة في إعدادات Render"}
+            return {"status": "error", "message": "المفاتيح غير موجودة في الإعدادات"}
 
-        # 2. استخدام النسخة الأساسية والمستقرة جداً (gemini-pro) التي تمنع ظهور خطأ 404
         genai.configure(api_key=gemini_key)
         model = genai.GenerativeModel('gemini-pro')
 
-        # 3. جلب البيانات من علي إكسبريس عبر ZenRows
-        zenrows_url = f"https://api.zenrows.com/v1/?apikey={zenrows_key}&url={request.url}&js_render=true"
-        response = requests.get(zenrows_url)
+        zenrows_params = {
+            "apikey": zenrows_key,
+            "url": request.url,
+            "js_render": "true"
+        }
         
+        response = requests.get("https://api.zenrows.com/v1/", params=zenrows_params)
+        
+        # === فخ كشف الأخطاء الدقيق ===
         if response.status_code != 200:
-            return {"status": "error", "message": f"خطأ في الاتصال بـ ZenRows: {response.status_code}"}
+            return {
+                "status": "error",
+                "message": f"خطأ {response.status_code} من زين روس",
+                "url_received": request.url, # لمعرفة ماذا أرسل فلاتر فلو بالضبط
+                "zenrows_details": response.text # لطباعة سبب الرفض الحقيقي من زين روس
+            }
 
-        # 4. توليد المحتوى
-        prompt = f"قم باستخراج البيانات الأساسية (الاسم، السعر، المواصفات) وصغ وصفاً تسويقياً جذاباً: {response.text[:20000]}"
+        prompt = f"قم باستخراج البيانات الأساسية (الاسم، السعر، المواصفات) من هذا النص، وصغ وصفاً تسويقياً جذاباً: {response.text[:20000]}"
         ai_response = model.generate_content(prompt)
 
         return {
@@ -48,5 +55,4 @@ async def scrape(request: ScrapeRequest):
         }
 
     except Exception as e:
-        # صائد الأخطاء: يمنع ظهور 500 Internal Error ويعطيك الخطأ الحقيقي
         return {"status": "error", "message": f"الخطأ بالتفصيل: {str(e)}"}
