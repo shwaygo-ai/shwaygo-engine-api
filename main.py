@@ -28,21 +28,7 @@ async def scrape(request: ScrapeRequest):
 
         genai.configure(api_key=gemini_key)
 
-        # === الحل الجذري: البحث التلقائي عن الموديل المسموح لمفتاحك ===
-        valid_model_name = None
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                valid_model_name = m.name.replace('models/', '')
-                # التقاط أي موديل حديث متاح
-                if 'gemini-1.5' in valid_model_name or 'gemini-1.0' in valid_model_name:
-                    break 
-        
-        if not valid_model_name:
-            return {"status": "error", "message": "مفتاحك لا يملك صلاحية الوصول لأي موديل توليد نصوص."}
-
-        model = genai.GenerativeModel(valid_model_name)
-        # ==============================================================
-
+        # === 1. جلب البيانات من علي إكسبريس عبر زين روس ===
         zenrows_params = {
             "apikey": zenrows_key,
             "url": request.url,
@@ -60,13 +46,44 @@ async def scrape(request: ScrapeRequest):
             }
 
         prompt = f"قم باستخراج البيانات الأساسية (الاسم، السعر، المواصفات) من هذا النص، وصغ وصفاً تسويقياً جذاباً: {response.text[:20000]}"
-        ai_response = model.generate_content(prompt)
+        
+        # === 2. الحل الفولاذي: محرك تجربة الموديلات بالترتيب ===
+        models_to_try = [
+            'gemini-1.5-flash',
+            'gemini-1.5-pro',
+            'gemini-1.0-pro',
+            'gemini-pro'
+        ]
+        
+        ai_text = None
+        used_model = None
+        last_error = ""
 
+        for model_name in models_to_try:
+            try:
+                # نجرب الموديل
+                model = genai.GenerativeModel(model_name)
+                ai_response = model.generate_content(prompt)
+                
+                # إذا نجح، نحفظ النتيجة ونوقف البحث فوراً
+                ai_text = ai_response.text
+                used_model = model_name
+                break 
+            except Exception as e:
+                # إذا فشل الموديل، نحفظ الخطأ ونجرب الموديل الذي يليه بصمت
+                last_error = str(e)
+                continue 
+        
+        # إذا جرب كل المشتتات وفشلت كلها (وهذا مستبعد جداً)
+        if not ai_text:
+            return {"status": "error", "message": f"فشلت جميع الموديلات. الخطأ الأخير: {last_error}"}
+
+        # === 3. إرجاع النتيجة النهائية لفلاتر فلو ===
         return {
             "status": "success",
-            "used_model": valid_model_name, # سيطبع لك هنا اسم الموديل الذي نجح أخيراً
-            "ai_content": ai_response.text
+            "used_model": used_model, # سيعرض لك اسم الموديل الذي نجح في المهمة
+            "ai_content": ai_text
         }
 
     except Exception as e:
-        return {"status": "error", "message": f"الخطأ بالتفصيل: {str(e)}"}
+        return {"status": "error", "message": f"خطأ غير متوقع: {str(e)}"}
