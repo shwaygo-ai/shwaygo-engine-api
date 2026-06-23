@@ -6,7 +6,6 @@ import requests
 
 app = FastAPI()
 
-# السماح لفلاتر فلو بالاتصال
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,7 +25,7 @@ async def scrape(request: ScrapeRequest):
         if not gemini_key or not zenrows_key:
             return {"status": "error", "message": "المفاتيح غير موجودة في الإعدادات"}
 
-        # === 1. جلب البيانات من زين روس (يعمل بنجاح تام) ===
+        # === 1. جلب البيانات من زين روس ===
         zenrows_params = {
             "apikey": zenrows_key,
             "url": request.url,
@@ -42,10 +41,11 @@ async def scrape(request: ScrapeRequest):
                 "details": response.text
             }
 
-        prompt = f"قم باستخراج البيانات الأساسية (الاسم، السعر، المواصفات) من هذا النص، وصغ وصفاً تسويقياً جذاباً للمنتج:\n\n{response.text[:15000]}"
+        # نجهز الأمر الذي سيقوم بتهيئة المنتج
+        prompt = f"قم باستخراج البيانات الأساسية (الاسم، السعر، المواصفات) من هذا النص، وصغ وصفاً تسويقياً جذاباً للمنتج لتجهيزه للبيع:\n\n{response.text[:15000]}"
         
-        # === 2. الاتصال المباشر بجوجل (تم تغيير الرابط للموديل المضمون gemini-pro) ===
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={gemini_key}"
+        # === 2. التغيير الجذري: استخدام الرابط المباشر لموديل 1.5-flash المتوافق مع مفتاحك الجديد ===
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
         headers = {"Content-Type": "application/json"}
         payload = {
             "contents": [{"parts": [{"text": prompt}]}]
@@ -63,7 +63,7 @@ async def scrape(request: ScrapeRequest):
             
         ai_text = gemini_data["candidates"][0]["content"]["parts"][0]["text"]
 
-        # === 3. إرجاع النتيجة النهائية ===
+        # === 3. إرجاع النتيجة النهائية لفلاتر فلو ===
         return {
             "status": "success",
             "ai_content": ai_text
