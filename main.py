@@ -1,44 +1,47 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from zenrows import ZenRowsClient
-import google.generativeai as genai
 import os
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import google.generativeai as genai
+from zenrows import ZenRowsClient
 
 app = FastAPI()
 
-# إعداد مفتاح API الخاص بـ Gemini من متغيرات البيئة في Render
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-
-# تعريف دالة المعالجة الأساسية
-def process_html(html_content):
-    # حالياً تعيد بيانات تجريبية لضمان عمل المسار البرمجي
-    return {"product_name": "Product Detected", "price": "Check site for price"}
-
+# تعريف الهيكل
 class ScrapeRequest(BaseModel):
     url: str
 
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
-    # إعداد عميل ZenRows
-    client = ZenRowsClient("c5c1fb32689738572ecce5fbfed1bc58f43e5954")
-    url = request.url
-    
-    # جلب محتوى الصفحة
-    response = client.get(url)
-    
-    # معالجة محتوى HTML
-    product_data = process_html(response.text)
-    
-    print([m.name for m in genai.list_models()])
-    model = genai.GenerativeModel('gemini-pro')
-    ai_response = model.generate_content(f"Write a marketing description for this product: {product_data}")
-    ai_content = ai_response.text
-    
-    # إرجاع النتيجة النهائية
-    return {
-        "status": "success",
-        "url": url,
-        "product_info": product_data,
-        "ai_content": ai_content,
-        "content_length": len(response.text)
-    }
+    try:
+        # 1. إعداد المفاتيح
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return {"status": "error", "message": "GEMINI_API_KEY not found"}
+        
+        genai.configure(api_key=api_key)
+        
+        # 2. طباعة النماذج المتاحة للـ Logs (لكي نعرف ما الذي يراه السيرفر)
+        print("--- جاري فحص النماذج المتاحة ---")
+        models = list(genai.list_models())
+        for m in models:
+            print(f"Model: {m.name}")
+        print("--- نهاية القائمة ---")
+
+        # 3. محاولة اختيار نموذج من القائمة المتاحة (سنجرب gemini-1.5-flash)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # 4. جلب البيانات (ZenRows)
+        client = ZenRowsClient(os.getenv("ZENROWS_API_KEY"))
+        response = client.get(request.url)
+        
+        # 5. التوليد بالذكاء الاصطناعي
+        ai_response = model.generate_content(f"Analyze this content: {response.text[:5000]}")
+        
+        return {
+            "status": "success",
+            "ai_content": ai_response.text
+        }
+        
+    except Exception as e:
+        print(f"خطأ أثناء التنفيذ: {str(e)}")
+        return {"status": "error", "details": str(e)}
