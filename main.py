@@ -33,15 +33,17 @@ async def scrape(request: ScrapeRequest):
         if response.status_code != 200:
             return {"status": "error", "message": "فشل السحب"}
 
-        # 2. الأمر الذكي (Prompt) لإجبار الذكاء الاصطناعي على تعبئة الـ 11 خانة
-        prompt = f"""
-        أنت الآن خبير تجارة إلكترونية. حلل بيانات المنتج التالية واستخرج المعلومات بدقة، وإذا وجدت بيانات ناقصة قم بتوليدها بذكاء. 
-        أجب فقط بكود JSON صحيح يحتوي على المفاتيح التالية (name, images, videos, description, features, specifications, seo_assets, faq_assets, reviews_assets, rating, back_reviews). 
-        لا تكتب أي مقدمة، فقط كود JSON.
         
+        # 2. الأمر الذكي (Prompt) المعدل لجلب "كل" الصور
+        prompt = f"""
+        أنت الآن خبير تجارة إلكترونية. حلل بيانات المنتج التالية.
+        استخرج "جميع" روابط الصور الموجودة في معرض صور المنتج (Image Gallery)، ولا تكتفِ بالصورة الرئيسية.
+        يجب أن يكون ردك "فقط" كود JSON بالتنسيق التالي:
+        {{"name": "", "images": ["رابط1", "رابط2", ...], "videos": [], "description": "", "features": [], "specifications": {}, "seo_assets": "", "faq_assets": [], "reviews_assets": [], "rating": "", "back_reviews": ""}}
         بيانات المنتج الخام: {response.text[:15000]}
         """
         
+    
         # 3. الاتصال المباشر بـ Gemini 3.5 Flash
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={gemini_key}"
         headers = {"Content-Type": "application/json"}
