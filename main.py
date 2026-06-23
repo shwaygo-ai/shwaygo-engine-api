@@ -1,46 +1,38 @@
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from zenrows import ZenRowsClient
-from processor import process_html
-app = FastAPI()
 import google.generativeai as genai
 import os
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-def generate_ai_content(product_name):
-    model = genai.GenerativeModel('gemini-pro')
-    prompt = f"اكتب وصفاً تسويقياً جذاباً، 5 مميزات، وكلمات مفتاحية للـ SEO للمنتج التالي: {product_name}"
-    response = model.generate_content(prompt)
-    return response.text
-# إعداد الـ CORS للسماح بالاتصال من FlutterFlow
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI()
+
+# إعداد مفتاح Gemini من متغيرات البيئة
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 class ScrapeRequest(BaseModel):
     url: str
 
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
-    client = ZenRowsClient("c5c1fb32689738572ecce5fbfed1bc58f43e7841")
-    
+    # إعداد عميل ZenRows
+    client = ZenRowsClient("c5c1fb32689738572ecce5fbfed1bc58f43e5954")
     url = request.url
+    
+    # جلب محتوى الصفحة
     response = client.get(url)
     
+    # معالجة البيانات (بافتراض وجود دالة process_html في ملفك)
     product_data = process_html(response.text)
-   
-ai_content = generate_ai_content(product_data.get("product_name", "هذا المنتج"))
-
-        return {
+    
+    # توليد المحتوى باستخدام Gemini
+    model = genai.GenerativeModel('gemini-pro')
+    ai_response = model.generate_content(f"قم بكتابة وصف تسويقي لهذا المنتج: {product_data}")
+    ai_content = ai_response.text
+    
+    return {
         "status": "success",
         "url": url,
         "product_info": product_data,
         "ai_content": ai_content,
         "content_length": len(response.text)
     }
-   
