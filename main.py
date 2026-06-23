@@ -1,3 +1,25 @@
+import os
+import json
+import requests
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# 1. تعريف التطبيق (هذا هو السطر الذي كان مفقوداً)
+app = FastAPI()
+
+# 2. إعدادات الأمان (مهمة لربط FlutterFlow)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ScrapeRequest(BaseModel):
+    url: str
+
+# 3. الدالة الرئيسية
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
     try:
@@ -7,14 +29,14 @@ async def scrape(request: ScrapeRequest):
         if not gemini_key or not zenrows_key:
             return {"status": "error", "message": "المفاتيح غير موجودة"}
 
-        # 1. سحب البيانات الخام (ZenRows)
+        # سحب البيانات الخام
         zenrows_params = {"apikey": zenrows_key, "url": request.url, "js_render": "true"}
         response = requests.get("https://api.zenrows.com/v1/", params=zenrows_params)
         
         if response.status_code != 200:
             return {"status": "error", "message": "فشل السحب"}
 
-        # 2. الأمر الذكي (Prompt) - لاحظ أننا ضاعفنا الأقواس {{ }}
+        # الأمر الذكي (مع الأقواس المضاعفة {{ }} لتجنب خطأ الـ f-string)
         prompt = f"""
         أنت الآن خبير تجارة إلكترونية. حلل بيانات المنتج التالية.
         استخرج "جميع" روابط الصور الموجودة في معرض صور المنتج (Image Gallery)، ولا تكتفِ بالصورة الرئيسية.
@@ -23,7 +45,6 @@ async def scrape(request: ScrapeRequest):
         بيانات المنتج الخام: {response.text[:15000]}
         """
         
-        # 3. الاتصال المباشر بـ Gemini 3.5 Flash
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={gemini_key}"
         headers = {"Content-Type": "application/json"}
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
@@ -33,7 +54,6 @@ async def scrape(request: ScrapeRequest):
         if gemini_response.status_code != 200:
             return {"status": "error", "message": "خطأ من جوجل"}
 
-        # 4. تنظيف ومعالجة النتيجة (JSON)
         ai_text = gemini_response.json()["candidates"][0]["content"]["parts"][0]["text"]
         ai_text = ai_text.replace("```json", "").replace("```", "").strip()
         
