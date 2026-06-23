@@ -6,8 +6,13 @@ import os
 
 app = FastAPI()
 
-# إعداد مفتاح Gemini من متغيرات البيئة
+# إعداد مفتاح API الخاص بـ Gemini من متغيرات البيئة في Render
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+
+# تعريف دالة المعالجة الأساسية
+def process_html(html_content):
+    # حالياً تعيد بيانات تجريبية لضمان عمل المسار البرمجي
+    return {"product_name": "Product Detected", "price": "Check site for price"}
 
 class ScrapeRequest(BaseModel):
     url: str
@@ -21,14 +26,15 @@ async def scrape(request: ScrapeRequest):
     # جلب محتوى الصفحة
     response = client.get(url)
     
-    # معالجة البيانات (بافتراض وجود دالة process_html في ملفك)
+    # معالجة محتوى HTML
     product_data = process_html(response.text)
     
-    # توليد المحتوى باستخدام Gemini
+    # استخدام Gemini لتوليد المحتوى
     model = genai.GenerativeModel('gemini-pro')
-    ai_response = model.generate_content(f"قم بكتابة وصف تسويقي لهذا المنتج: {product_data}")
+    ai_response = model.generate_content(f"Write a marketing description for this product: {product_data}")
     ai_content = ai_response.text
     
+    # إرجاع النتيجة النهائية
     return {
         "status": "success",
         "url": url,
