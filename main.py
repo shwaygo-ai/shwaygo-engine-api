@@ -27,19 +27,16 @@ class ScrapeRequest(BaseModel):
 
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
-    # الكي الخاص بك مدمج هنا
     client = ZenRowsClient("c5c1fb32689738572ecce5fbfed1bc58f43e7841")
     
     url = request.url
-    # جلب محتوى الصفحة
     response = client.get(url)
     
-   # معالجة البيانات
     product_data = process_html(response.text)
-    # أضف هذا السطر قبل الـ return
+   
 ai_content = generate_ai_content(product_data.get("product_name", "هذا المنتج"))
 
-return {
+        return {
         "status": "success",
         "url": url,
         "product_info": product_data,
