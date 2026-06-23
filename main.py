@@ -3,7 +3,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
-import google.generativeai as genai
 
 app = FastAPI()
 
@@ -26,8 +25,6 @@ async def scrape(request: ScrapeRequest):
         if not gemini_key or not zenrows_key:
             return {"status": "error", "message": "المفاتيح غير موجودة في الإعدادات"}
 
-        genai.configure(api_key=gemini_key)
-
         # === 1. جلب البيانات من علي إكسبريس عبر زين روس ===
         zenrows_params = {
             "apikey": zenrows_key,
@@ -45,43 +42,44 @@ async def scrape(request: ScrapeRequest):
                 "zenrows_details": response.text
             }
 
-        prompt = f"قم باستخراج البيانات الأساسية (الاسم، السعر، المواصفات) من هذا النص، وصغ وصفاً تسويقياً جذاباً: {response.text[:20000]}"
+        # === 2. الاتصال المباشر بسيرفر جوجل (بدون مكتبة بايثون المعقدة) ===
+        # نقص طول النص قليلاً لضمان عدم تجاوز الحد الأقصى للطلب المباشر
+        prompt = f"قم باستخراج البيانات الأساسية (الاسم، السعر، المواصفات) من هذا النص، وصغ وصفاً تسويقياً جذاباً للمنتج:\n\n{response.text[:15000]}"
         
-        # === 2. الحل الفولاذي: محرك تجربة الموديلات بالترتيب ===
-        models_to_try = [
-            'gemini-1.5-flash',
-            'gemini-1.5-pro',
-            'gemini-1.0-pro',
-            'gemini-pro'
-        ]
+        # نستخدم الرابط الرسمي والمباشر لموديل 1.5-flash السريع
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [
+                {"parts": [{"text": prompt}]}
+            ]
+        }
         
-        ai_text = None
-        used_model = None
-        last_error = ""
-
-        for model_name in models_to_try:
-            try:
-                # نجرب الموديل
-                model = genai.GenerativeModel(model_name)
-                ai_response = model.generate_content(prompt)
-                
-                # إذا نجح، نحفظ النتيجة ونوقف البحث فوراً
-                ai_text = ai_response.text
-                used_model = model_name
-                break 
-            except Exception as e:
-                # إذا فشل الموديل، نحفظ الخطأ ونجرب الموديل الذي يليه بصمت
-                last_error = str(e)
-                continue 
+        gemini_response = requests.post(gemini_url, headers=headers, json=payload)
+        gemini_data = gemini_response.json()
         
-        # إذا جرب كل المشتتات وفشلت كلها (وهذا مستبعد جداً)
-        if not ai_text:
-            return {"status": "error", "message": f"فشلت جميع الموديلات. الخطأ الأخير: {last_error}"}
+        # إذا رفض جوجل الطلب لأي سبب، سنرى رده التفصيلي مباشرة
+        if gemini_response.status_code != 200:
+            return {
+                "status": "error",
+                "message": f"خطأ من جوجل: {gemini_response.status_code}",
+                "google_details": gemini_data 
+            }
+            
+        # استخراج النص الصافي من خريطة الرد
+        try:
+            ai_text = gemini_data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            return {
+                "status": "error",
+                "message": "رد جوجل كان فارغاً أو بتنسيق غير متوقع",
+                "google_details": gemini_data
+            }
 
         # === 3. إرجاع النتيجة النهائية لفلاتر فلو ===
         return {
             "status": "success",
-            "used_model": used_model, # سيعرض لك اسم الموديل الذي نجح في المهمة
+            "used_model": "gemini-1.5-flash (Direct Connection)",
             "ai_content": ai_text
         }
 
