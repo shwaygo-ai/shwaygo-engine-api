@@ -1,3 +1,25 @@
+import os
+import json
+import requests
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# 1. أولاً: تعريف التطبيق (يجب أن يكون في الأعلى)
+app = FastAPI()
+
+# 2. إعدادات الأمان
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ScrapeRequest(BaseModel):
+    url: str
+
+# 3. أخيراً: تعريف الدالة (الآن سيتعرف السيرفر على app)
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
     try:
@@ -5,16 +27,14 @@ async def scrape(request: ScrapeRequest):
         zenrows_key = os.environ.get("ZENROWS_API_KEY")
 
         if not gemini_key or not zenrows_key:
-            return {"status": "error", "message": "المفاتيح مفقودة"}
+            return {"status": "error", "message": "المفاتيح غير موجودة"}
 
-        # 1. سحب البيانات الخام
         zenrows_params = {"apikey": zenrows_key, "url": request.url, "js_render": "true"}
         response = requests.get("https://api.zenrows.com/v1/", params=zenrows_params)
         
         if response.status_code != 200:
             return {"status": "error", "message": "فشل السحب"}
 
-        # 2. الـ Prompt "العسكري" (ملاحظة: ضاعفنا الأقواس {{ }} لتفادي خطأ البرمجة)
         prompt = f"""
         أنت محرك معالجة بيانات منتجات. مهمتك هي استخراج وتعبئة الهيكل التالي بدقة 100%. 
         إذا كانت المعلومة غير موجودة في البيانات الخام، قم بتوليدها بذكاء.
