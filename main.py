@@ -1,22 +1,3 @@
-import os
-import json
-import requests
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class ScrapeRequest(BaseModel):
-    url: str
-
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
     try:
@@ -33,17 +14,15 @@ async def scrape(request: ScrapeRequest):
         if response.status_code != 200:
             return {"status": "error", "message": "فشل السحب"}
 
-        
-        # 2. الأمر الذكي (Prompt) المعدل لجلب "كل" الصور
+        # 2. الأمر الذكي (Prompt) - لاحظ أننا ضاعفنا الأقواس {{ }}
         prompt = f"""
         أنت الآن خبير تجارة إلكترونية. حلل بيانات المنتج التالية.
         استخرج "جميع" روابط الصور الموجودة في معرض صور المنتج (Image Gallery)، ولا تكتفِ بالصورة الرئيسية.
         يجب أن يكون ردك "فقط" كود JSON بالتنسيق التالي:
-        {{"name": "", "images": ["رابط1", "رابط2", ...], "videos": [], "description": "", "features": [], "specifications": {}, "seo_assets": "", "faq_assets": [], "reviews_assets": [], "rating": "", "back_reviews": ""}}
+        {{"name": "", "images": ["رابط1", "رابط2", ...], "videos": [], "description": "", "features": [], "specifications": {{}}, "seo_assets": "", "faq_assets": [], "reviews_assets": [], "rating": "", "back_reviews": ""}}
         بيانات المنتج الخام: {response.text[:15000]}
         """
         
-    
         # 3. الاتصال المباشر بـ Gemini 3.5 Flash
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={gemini_key}"
         headers = {"Content-Type": "application/json"}
@@ -58,10 +37,7 @@ async def scrape(request: ScrapeRequest):
         ai_text = gemini_response.json()["candidates"][0]["content"]["parts"][0]["text"]
         ai_text = ai_text.replace("```json", "").replace("```", "").strip()
         
-        # تحويل النص إلى قاموس بيانات
         data = json.loads(ai_text)
-
-        # 5. إرجاع النتيجة
         return {"status": "success", "data": data}
 
     except Exception as e:
