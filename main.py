@@ -27,7 +27,8 @@ async def scrape(request: ScrapeRequest):
             return {"status": "error", "message": "المفاتيح غير موجودة في الإعدادات"}
 
         genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel('gemini-pro')
+        # التحديث هنا: استخدام الاسم التفصيلي الحديث الذي يطلبه سيرفر جوجل
+        model = genai.GenerativeModel('gemini-1.5-pro')
 
         zenrows_params = {
             "apikey": zenrows_key,
@@ -37,13 +38,12 @@ async def scrape(request: ScrapeRequest):
         
         response = requests.get("https://api.zenrows.com/v1/", params=zenrows_params)
         
-        # === فخ كشف الأخطاء الدقيق ===
         if response.status_code != 200:
             return {
                 "status": "error",
                 "message": f"خطأ {response.status_code} من زين روس",
-                "url_received": request.url, # لمعرفة ماذا أرسل فلاتر فلو بالضبط
-                "zenrows_details": response.text # لطباعة سبب الرفض الحقيقي من زين روس
+                "url_received": request.url,
+                "zenrows_details": response.text
             }
 
         prompt = f"قم باستخراج البيانات الأساسية (الاسم، السعر، المواصفات) من هذا النص، وصغ وصفاً تسويقياً جذاباً: {response.text[:20000]}"
