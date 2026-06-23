@@ -1,8 +1,9 @@
 import os
+import json
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import requests
 
 app = FastAPI()
 
@@ -23,51 +24,43 @@ async def scrape(request: ScrapeRequest):
         zenrows_key = os.environ.get("ZENROWS_API_KEY")
 
         if not gemini_key or not zenrows_key:
-            return {"status": "error", "message": "المفاتيح غير موجودة في الإعدادات"}
+            return {"status": "error", "message": "المفاتيح غير موجودة"}
 
-        # === 1. جلب البيانات من زين روس (الآن مستقر 100%) ===
-        zenrows_params = {
-            "apikey": zenrows_key,
-            "url": request.url,
-            "js_render": "true"
-        }
-        
+        # 1. سحب البيانات الخام (ZenRows)
+        zenrows_params = {"apikey": zenrows_key, "url": request.url, "js_render": "true"}
         response = requests.get("https://api.zenrows.com/v1/", params=zenrows_params)
         
         if response.status_code != 200:
-            return {
-                "status": "error",
-                "message": f"خطأ من زين روس: {response.status_code}",
-                "details": response.text
-            }
+            return {"status": "error", "message": "فشل السحب"}
 
-        prompt = f"قم باستخراج البيانات الأساسية (الاسم، السعر، المواصفات) من هذا النص، وصغ وصفاً تسويقياً جذاباً للمنتج لتجهيزه للبيع:\n\n{response.text[:15000]}"
+        # 2. الأمر الذكي (Prompt) لإجبار الذكاء الاصطناعي على تعبئة الـ 11 خانة
+        prompt = f"""
+        أنت الآن خبير تجارة إلكترونية. حلل بيانات المنتج التالية واستخرج المعلومات بدقة، وإذا وجدت بيانات ناقصة قم بتوليدها بذكاء. 
+        أجب فقط بكود JSON صحيح يحتوي على المفاتيح التالية (name, images, videos, description, features, specifications, seo_assets, faq_assets, reviews_assets, rating, back_reviews). 
+        لا تكتب أي مقدمة، فقط كود JSON.
         
-        # === 2. التحديث الذهبي: استخدام موديل gemini-3.5-flash الذي اكتشفناه ===
+        بيانات المنتج الخام: {response.text[:15000]}
+        """
+        
+        # 3. الاتصال المباشر بـ Gemini 3.5 Flash
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={gemini_key}"
         headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}]
-        }
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
         
         gemini_response = requests.post(gemini_url, headers=headers, json=payload)
-        gemini_data = gemini_response.json()
         
         if gemini_response.status_code != 200:
-            return {
-                "status": "error",
-                "message": f"خطأ من جوجل: {gemini_response.status_code}",
-                "google_details": gemini_data 
-            }
-            
-        ai_text = gemini_data["candidates"][0]["content"]["parts"][0]["text"]
+            return {"status": "error", "message": "خطأ من جوجل"}
 
-        # === 3. إرجاع النتيجة النهائية لمحرك ShwayGo Engine ===
-        return {
-            "status": "success",
-            "used_model": "gemini-3.5-flash",
-            "ai_content": ai_text
-        }
+        # 4. تنظيف ومعالجة النتيجة (JSON)
+        ai_text = gemini_response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        ai_text = ai_text.replace("```json", "").replace("```", "").strip()
+        
+        # تحويل النص إلى قاموس بيانات
+        data = json.loads(ai_text)
+
+        # 5. إرجاع النتيجة
+        return {"status": "success", "data": data}
 
     except Exception as e:
-        return {"status": "error", "message": f"خطأ غير متوقع: {str(e)}"}
+        return {"status": "error", "message": str(e)}
