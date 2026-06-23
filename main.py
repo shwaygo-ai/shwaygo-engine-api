@@ -1,31 +1,35 @@
-import os
+import os # هذا ضروري لقراءة المتغيرات من السيرفر
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import requests
 import google.generativeai as genai
-from zenrows import ZenRowsClient
 
-# إعداد التطبيق
 app = FastAPI()
 
-# إعداد العملاء (Client Configuration)
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-zenrows_client = ZenRowsClient(os.getenv("ZENROWS_API_KEY"))
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# تعريف نموذج الذكاء الاصطناعي (باستخدام النموذج الموثوق من القائمة)
-model = genai.GenerativeModel('models/gemini-3.5-flash')
+# هنا الكود يقرأ المفاتيح من إعدادات Render تلقائياً
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 class ScrapeRequest(BaseModel):
     url: str
 
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
+    # قراءة مفتاح زين روس من المتغيرات أيضاً
+    zenrows_key = os.environ.get("ZENROWS_API_KEY")
+    zenrows_url = f"https://api.zenrows.com/v1/?apikey={zenrows_key}&url={request.url}&js_render=true"
+    
     try:
-        # 1. جلب محتوى الصفحة باستخدام ZenRows
-        response = zenrows_client.get(request.url)
-        
-        # 2. إرسال المحتوى للذكاء الاصطناعي
-        # قمنا باختصار المحتوى لتجنب مشاكل الطول الزائد
-        prompt = f"Analyze this product content and provide a marketing description: {response.text[:10000]}"
+        response = requests.get(zenrows_url)
+        prompt = f"قم باستخراج البيانات الحقيقية (الاسم، السعر، المواصفات) من هذا النص وصغ وصفاً تسويقياً جذاباً: {response.text[:20000]}"
         ai_response = model.generate_content(prompt)
         
         return {
@@ -33,9 +37,5 @@ async def scrape(request: ScrapeRequest):
             "url": request.url,
             "ai_content": ai_response.text
         }
-        
     except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+        return {"status": "error", "message": str(e)}
