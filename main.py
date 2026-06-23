@@ -30,7 +30,7 @@ async def scrape(request: ScrapeRequest):
     product_data = process_html(response.text)
     
     # استخدام Gemini لتوليد المحتوى
-    model = genai.GenerativeModel('gemini-pro')
+    model = genai.GenerativeModel('gemini-1.5-flash')
     ai_response = model.generate_content(f"Write a marketing description for this product: {product_data}")
     ai_content = ai_response.text
     
