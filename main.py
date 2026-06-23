@@ -6,6 +6,7 @@ import requests
 
 app = FastAPI()
 
+# السماح لفلاتر فلو بالاتصال
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,7 +26,7 @@ async def scrape(request: ScrapeRequest):
         if not gemini_key or not zenrows_key:
             return {"status": "error", "message": "المفاتيح غير موجودة في الإعدادات"}
 
-        # === 1. جلب البيانات من علي إكسبريس عبر زين روس ===
+        # === 1. جلب البيانات من زين روس (يعمل بنجاح تام) ===
         zenrows_params = {
             "apikey": zenrows_key,
             "url": request.url,
@@ -37,28 +38,22 @@ async def scrape(request: ScrapeRequest):
         if response.status_code != 200:
             return {
                 "status": "error",
-                "message": f"خطأ {response.status_code} من زين روس",
-                "url_received": request.url,
-                "zenrows_details": response.text
+                "message": f"خطأ من زين روس: {response.status_code}",
+                "details": response.text
             }
 
-        # === 2. الاتصال المباشر بسيرفر جوجل (بدون مكتبة بايثون المعقدة) ===
-        # نقص طول النص قليلاً لضمان عدم تجاوز الحد الأقصى للطلب المباشر
         prompt = f"قم باستخراج البيانات الأساسية (الاسم، السعر، المواصفات) من هذا النص، وصغ وصفاً تسويقياً جذاباً للمنتج:\n\n{response.text[:15000]}"
         
-        # نستخدم الرابط الرسمي والمباشر لموديل 1.5-flash السريع
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
+        # === 2. الاتصال المباشر بجوجل (تم تغيير الرابط للموديل المضمون gemini-pro) ===
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={gemini_key}"
         headers = {"Content-Type": "application/json"}
         payload = {
-            "contents": [
-                {"parts": [{"text": prompt}]}
-            ]
+            "contents": [{"parts": [{"text": prompt}]}]
         }
         
         gemini_response = requests.post(gemini_url, headers=headers, json=payload)
         gemini_data = gemini_response.json()
         
-        # إذا رفض جوجل الطلب لأي سبب، سنرى رده التفصيلي مباشرة
         if gemini_response.status_code != 200:
             return {
                 "status": "error",
@@ -66,20 +61,11 @@ async def scrape(request: ScrapeRequest):
                 "google_details": gemini_data 
             }
             
-        # استخراج النص الصافي من خريطة الرد
-        try:
-            ai_text = gemini_data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError):
-            return {
-                "status": "error",
-                "message": "رد جوجل كان فارغاً أو بتنسيق غير متوقع",
-                "google_details": gemini_data
-            }
+        ai_text = gemini_data["candidates"][0]["content"]["parts"][0]["text"]
 
-        # === 3. إرجاع النتيجة النهائية لفلاتر فلو ===
+        # === 3. إرجاع النتيجة النهائية ===
         return {
             "status": "success",
-            "used_model": "gemini-1.5-flash (Direct Connection)",
             "ai_content": ai_text
         }
 
