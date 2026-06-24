@@ -31,7 +31,7 @@ async def scrape(request: ScrapeRequest):
         headers = {"Content-Type": "application/json"}
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         
-        # التعديل: طباعة البيانات قبل الإرسال للـ Logs
+        # سجلات الطباعة
         print("GEMINI URL:")
         print(gemini_url)
         print("PAYLOAD:")
@@ -39,25 +39,23 @@ async def scrape(request: ScrapeRequest):
 
         gemini_response = requests.post(gemini_url, headers=headers, json=payload)
         
-        # التعديل: طباعة النتيجة فوراً للـ Logs
+        # سجلات النتيجة
         print("STATUS CODE:")
         print(gemini_response.status_code)
         print("RESPONSE:")
         print(gemini_response.text)
 
-        # التعديل: معالجة الخطأ بالتفصيل
+        # معالجة الخطأ
         if gemini_response.status_code != 200:
             return {
                 "status": "error",
                 "status_code": gemini_response.status_code,
-                "response_text": gemini_response.text,
-                "response_json": gemini_response.json() if gemini_response.text else None
+                "response_text": gemini_response.text
             }
         
-        # تنظيف النتيجة
+        # معالجة النص وتنظيفه
         ai_text = gemini_response.json()["candidates"][0]["content"]["parts"][0]["text"]
-        ai_text = ai_text.replace("```json", "").replace("
-```", "").strip()
+        ai_text = ai_text.replace("```json", "").replace("```", "").strip()
         
         data = json.loads(ai_text)
         return {"status": "success", "data": data}
