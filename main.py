@@ -33,7 +33,7 @@ async def scrape(request: ScrapeRequest):
         Raw Data: {response.text[:15000]}
         """
 
-        gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}'
+        gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={gemini_key}'
         headers = {'Content-Type': 'application/json'}
         payload = {'contents': [{'parts': [{'text': prompt}]}]}
         
