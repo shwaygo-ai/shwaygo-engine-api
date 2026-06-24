@@ -15,13 +15,14 @@ async def scrape(request: ScrapeRequest):
         gemini_key = os.environ.get("GEMINI_API_KEY")
         zenrows_key = os.environ.get("ZENROWS_API_KEY")
 
-        # سحب البيانات من ZenRows
+        # سحب البيانات
         zenrows_params = {"apikey": zenrows_key, "url": request.url, "js_render": "true"}
         response = requests.get("https://api.zenrows.com/v1/", params=zenrows_params)
         
-        # تحضير الـ Prompt
+        # التعديل: طلب قائمة صور
         prompt = f"""
         أنت خبير تجارة إلكترونية. حلل البيانات التالية واستخرج المعلومات بدقة.
+        مهم جداً: في خانة 'images' استخرج جميع الروابط الموجودة لصور المنتج وضعها في قائمة (List).
         أجب فقط بـ JSON بالتنسيق التالي:
         {{"name": "", "images": [], "videos": [], "description": "", "features": [], "specifications": {{}}, "seo_assets": {{}}, "faq_assets": [], "reviews_assets": [], "rating": "", "back_reviews": ""}}
         البيانات الخام: {response.text[:15000]}
@@ -31,31 +32,12 @@ async def scrape(request: ScrapeRequest):
         headers = {"Content-Type": "application/json"}
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         
-        # سجلات الطباعة
-        print("GEMINI URL:")
-        print(gemini_url)
-        print("PAYLOAD:")
-        print(json.dumps(payload, ensure_ascii=False)[:1000])
-
         gemini_response = requests.post(gemini_url, headers=headers, json=payload)
         
-        # سجلات النتيجة
-        print("STATUS CODE:")
-        print(gemini_response.status_code)
-        print("RESPONSE:")
-        print(gemini_response.text)
-
-        # معالجة الخطأ
-        if gemini_response.status_code != 200:
-            return {
-                "status": "error",
-                "status_code": gemini_response.status_code,
-                "response_text": gemini_response.text
-            }
-        
-        # معالجة النص وتنظيفه
+        # معالجة النتيجة
         ai_text = gemini_response.json()["candidates"][0]["content"]["parts"][0]["text"]
-        ai_text = ai_text.replace("```json", "").replace("```", "").strip()
+        ai_text = ai_text.replace("```json", "").replace("
+```", "").strip()
         
         data = json.loads(ai_text)
         return {"status": "success", "data": data}
