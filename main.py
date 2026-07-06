@@ -23,79 +23,121 @@ async def scrape(request: ScrapeRequest):
         gemini_key = os.environ.get("GEMINI_API_KEY")
         zenrows_key = os.environ.get("ZENROWS_API_KEY")
 
-        # سحب البيانات الخام من الموقع
-        zenrows_params = {"apikey": zenrows_key, "url": request.url, "js_render": "true"}
-        response = requests.get("https://api.zenrows.com/v1/", params=zenrows_params)
-        raw_html = response.text[:80000] # حجم مناسب لجلب كل الصور والفيديوهات
+        zenrows_params = {
+            "apikey": zenrows_key,
+            "url": request.url,
+            "js_render": "true",
+        }
 
-        # صياغة الأمر للدورين: الاستخراج بدقة والتأليف الاحترافي لباقي الصفحات
+        response = requests.get(
+            "https://api.zenrows.com/v1/",
+            params=zenrows_params,
+            timeout=60,
+        )
+
+        raw_html = response.text[:80000]
+
         prompt = f"""
-        You are the core engine of 'ShwayGo' (a trending e-commerce optimization SaaS).
-        Your job is split into two parts based on the raw HTML provided:
+You are ShwayGo Engine, an e-commerce product package generator.
 
-        PART 1: DIRECT EXTRACTION (The 5 Core Assets)
-        1. Extract ALL available product image URLs into the 'images' array. Do not miss any.
-        2. Extract ALL available product video URLs into the 'videos' array.
-        3. Extract the product rating/stars into 'rating'.
-        4. Extract the raw product title and raw description from the HTML to use as your context.
+Extract and generate product data from the provided HTML.
 
-        PART 2: AI CREATION & MARKETING AUTHORING (The Remaining Pages)
-        Based ONLY on the extracted raw title and description, you must CRAFT and GENERATE high-converting, trending marketing content for the other fields:
-        1. 'name': Write an optimized, catchy, trending product title.
-        2. 'description': Write a highly persuasive, emotional, and conversion-focused marketing description (do NOT just copy the raw text, enhance it for social media trends).
-        3. 'features': Generate a bulleted list of 5 powerful emotional selling features.
-        4. 'specifications': Format the key technical specifications cleanly into a JSON object.
-        5. 'seo_assets': Generate a trending SEO title, a meta description, and 5-10 high-traffic keywords.
-        6. 'faq_assets': Compose 3-5 frequently asked questions and answers that overcome customer doubts.
-        7. 'reviews_assets' & 'back_reviews': Author 3-5 realistic, high-quality positive customer reviews.
+Return ONLY valid JSON. No markdown. No explanation.
 
-        Return ONLY a clean JSON object with this exact structure:
-        {{
-            "name": "AI Generated Trending Name",
-            "images": ["Scraped URL 1", "Scraped URL 2", "..."],
-            "videos": ["Scraped Video URL 1", "..."],
-            "description": "AI Generated Marketing Description",
-            "features": ["Feature 1", "Feature 2"],
-            "specifications": {{"Color": "Black", "Size": "M"}},
-            "seo_assets": {{"title": "", "description": "", "keywords": []}},
-            "faq_assets": [{{"q": "", "a": ""}}],
-            "reviews_assets": ["Review 1", "Review 2"],
-            "rating": "Scraped Rating",
-            "back_reviews": "AI Generated Back Reviews Summary"
-        }}
+Use this exact JSON structure:
 
-        Raw HTML Context: {raw_html}
-        """
+{{
+  "name": "Optimized product name",
+  "images": ["image_url_1", "image_url_2"],
+  "videos": ["video_url_1"],
+  "description": "Marketing product description",
+  "features": ["Feature 1", "Feature 2", "Feature 3", "Feature 4", "Feature 5"],
+  "specifications": {{"Color": "Black", "Size": "M"}},
+  "seo_assets": {{
+    "title": "SEO title",
+    "description": "SEO meta description",
+    "keywords": ["keyword 1", "keyword 2"]
+  }},
+  "faq_assets": [
+    {{"q": "Question 1", "a": "Answer 1"}},
+    {{"q": "Question 2", "a": "Answer 2"}}
+  ],
+  "reviews_assets": ["Review 1", "Review 2", "Review 3"],
+  "rating": "4.8"
+}}
 
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={gemini_key}"
+Raw HTML:
+{raw_html}
+"""
+
+        gemini_url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-3.5-flash:generateContent?key={gemini_key}"
+        )
+
         headers = {"Content-Type": "application/json"}
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
-        
-        gemini_response = requests.post(gemini_url, headers=headers, json=payload)
+
+        gemini_response = requests.post(
+            gemini_url,
+            headers=headers,
+            json=payload,
+            timeout=90,
+        )
+
         gemini_data = gemini_response.json()
 
         if "candidates" not in gemini_data:
-            return {"status": "error", "message": "جوجل رفضت الطلب", "google_error": gemini_data}
-        
+            return {
+                "status": "error",
+                "message": "جوجل رفضت الطلب",
+                "google_error": gemini_data,
+            }
+
         ai_text = gemini_data["candidates"][0]["content"]["parts"][0]["text"]
         ai_text = ai_text.replace("```json", "").replace("```", "").strip()
-        
+
         data = json.loads(ai_text)
 
-final_data = {
-    "names": data.get("name", ""),
-    "description": data.get("description", ""),
-    "key_features": "\n".join(data.get("features", [])) if isinstance(data.get("features"), list) else str(data.get("features", "")),
-    "specifications": json.dumps(data.get("specifications", {}), ensure_ascii=False),
-    "seo_keywords": ", ".join(data.get("seo_assets", {}).get("keywords", [])) if isinstance(data.get("seo_assets"), dict) else "",
-    "faqs": "\n".join([f"Q: {x.get('q', '')}\nA: {x.get('a', '')}" for x in data.get("faq_assets", [])]) if isinstance(data.get("faq_assets"), list) else "",
-    "reviews_text": "\n".join(data.get("reviews_assets", [])) if isinstance(data.get("reviews_assets"), list) else str(data.get("reviews_assets", "")),
-    "product_rating": float(str(data.get("rating", "0")).replace("/5", "").strip() or 0),
-    "images": data.get("images", []),
-    "videos_link": "\n".join(data.get("videos", [])) if isinstance(data.get("videos"), list) else str(data.get("videos", ""))
-}
+        final_data = {
+            "names": data.get("name", ""),
+            "description": data.get("description", ""),
+            "key_features": "\n".join(data.get("features", []))
+            if isinstance(data.get("features"), list)
+            else str(data.get("features", "")),
+            "specifications": json.dumps(
+                data.get("specifications", {}),
+                ensure_ascii=False,
+            ),
+            "seo_keywords": ", ".join(
+                data.get("seo_assets", {}).get("keywords", [])
+            )
+            if isinstance(data.get("seo_assets"), dict)
+            else "",
+            "faqs": "\n".join(
+                [
+                    f"Q: {item.get('q', '')}\nA: {item.get('a', '')}"
+                    for item in data.get("faq_assets", [])
+                    if isinstance(item, dict)
+                ]
+            )
+            if isinstance(data.get("faq_assets"), list)
+            else "",
+            "reviews_text": "\n".join(data.get("reviews_assets", []))
+            if isinstance(data.get("reviews_assets"), list)
+            else str(data.get("reviews_assets", "")),
+            "product_rating": float(
+                str(data.get("rating", "0")).replace("/5", "").strip() or 0
+            ),
+            "images": data.get("images", [])
+            if isinstance(data.get("images"), list)
+            else [],
+            "videos_link": "\n".join(data.get("videos", []))
+            if isinstance(data.get("videos"), list)
+            else str(data.get("videos", "")),
+        }
 
-return {"status": "success", "data": final_data}
+        return {"status": "success", "data": final_data}
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
