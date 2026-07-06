@@ -81,7 +81,21 @@ async def scrape(request: ScrapeRequest):
         ai_text = ai_text.replace("```json", "").replace("```", "").strip()
         
         data = json.loads(ai_text)
-        return {"status": "success", "data": data}
+
+final_data = {
+    "names": data.get("name", ""),
+    "description": data.get("description", ""),
+    "key_features": "\n".join(data.get("features", [])) if isinstance(data.get("features"), list) else str(data.get("features", "")),
+    "specifications": json.dumps(data.get("specifications", {}), ensure_ascii=False),
+    "seo_keywords": ", ".join(data.get("seo_assets", {}).get("keywords", [])) if isinstance(data.get("seo_assets"), dict) else "",
+    "faqs": "\n".join([f"Q: {x.get('q', '')}\nA: {x.get('a', '')}" for x in data.get("faq_assets", [])]) if isinstance(data.get("faq_assets"), list) else "",
+    "reviews_text": "\n".join(data.get("reviews_assets", [])) if isinstance(data.get("reviews_assets"), list) else str(data.get("reviews_assets", "")),
+    "product_rating": float(str(data.get("rating", "0")).replace("/5", "").strip() or 0),
+    "images": data.get("images", []),
+    "videos_link": "\n".join(data.get("videos", [])) if isinstance(data.get("videos"), list) else str(data.get("videos", ""))
+}
+
+return {"status": "success", "data": final_data}
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
