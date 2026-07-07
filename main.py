@@ -21,21 +21,46 @@ class ScrapeRequest(BaseModel):
 async def scrape(request: ScrapeRequest):
     try:
         gemini_key = os.environ.get("GEMINI_API_KEY")
-        zenrows_key = os.environ.get("ZENROWS_API_KEY")
+        scrapingant_key = os.environ.get("SCRAPINGANT_API_KEY")
 
-        zenrows_params = {
-            "apikey": zenrows_key,
-            "url": request.url,
-            "js_render": "true",
-        }
+        if not gemini_key or not scrapingant_key:
+            return {"status": "error", "message": "Missing API keys"}
 
-        response = requests.get(
-            "https://api.zenrows.com/v1/",
-            params=zenrows_params,
-            timeout=60,
+        scrape_response = requests.get(
+            "https://api.scrapingant.com/v2/general",
+            params={
+                "url": request.url,
+                "x-api-key": scrapingant_key,
+                "browser": "true",
+            },
+            timeout=90,
         )
 
-        raw_html = response.text[:80000]
+        raw_html = scrape_response.text[:80000]
+
+        if scrape_response.status_code != 200:
+            return {
+                "status": "error",
+                "message": "ScrapingAnt failed",
+                "scraping_status": scrape_response.status_code,
+                "scraping_preview": raw_html[:500],
+            }
+
+        blocked_words = [
+            "ScrapingAnt",
+            "ZenRows Web Scraping API",
+            "subscription",
+            "AUTH005",
+            "Trial expired",
+            "API token",
+        ]
+
+        if any(word.lower() in raw_html.lower() for word in blocked_words):
+            return {
+                "status": "error",
+                "message": "Scraper returned service page, not product page",
+                "scraping_preview": raw_html[:800],
+            }
 
         prompt = f"""
 You are ShwayGo Engine, an e-commerce product package generator.
@@ -75,13 +100,10 @@ Raw HTML:
             f"gemini-3.5-flash:generateContent?key={gemini_key}"
         )
 
-        headers = {"Content-Type": "application/json"}
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
         gemini_response = requests.post(
             gemini_url,
-            headers=headers,
-            json=payload,
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
             timeout=90,
         )
 
@@ -90,7 +112,7 @@ Raw HTML:
         if "candidates" not in gemini_data:
             return {
                 "status": "error",
-                "message": "جوجل رفضت الطلب",
+                "message": "Google Gemini rejected the request",
                 "google_error": gemini_data,
             }
 
@@ -105,13 +127,8 @@ Raw HTML:
             "key_features": "\n".join(data.get("features", []))
             if isinstance(data.get("features"), list)
             else str(data.get("features", "")),
-            "specifications": json.dumps(
-                data.get("specifications", {}),
-                ensure_ascii=False,
-            ),
-            "seo_keywords": ", ".join(
-                data.get("seo_assets", {}).get("keywords", [])
-            )
+            "specifications": json.dumps(data.get("specifications", {}), ensure_ascii=False),
+            "seo_keywords": ", ".join(data.get("seo_assets", {}).get("keywords", []))
             if isinstance(data.get("seo_assets"), dict)
             else "",
             "faqs": "\n".join(
@@ -126,12 +143,8 @@ Raw HTML:
             "reviews_text": "\n".join(data.get("reviews_assets", []))
             if isinstance(data.get("reviews_assets"), list)
             else str(data.get("reviews_assets", "")),
-            "product_rating": float(
-                str(data.get("rating", "0")).replace("/5", "").strip() or 0
-            ),
-            "images": data.get("images", [])
-            if isinstance(data.get("images"), list)
-            else [],
+            "product_rating": float(str(data.get("rating", "0")).replace("/5", "").strip() or 0),
+            "images": data.get("images", []) if isinstance(data.get("images"), list) else [],
             "videos_link": "\n".join(data.get("videos", []))
             if isinstance(data.get("videos"), list)
             else str(data.get("videos", "")),
