@@ -415,11 +415,27 @@ def fetch_supplier_html(
     )
 
     html = response.text
-with open("debug_page.html", "w", encoding="utf-8") as f:
-    f.write(html)
 
-print("HTML LENGTH:", len(html))
-print(html[:3000])
+    # Temporary diagnostics shown in Render Logs.
+    print("HTML LENGTH:", len(html))
+    print(
+        "HTML CHECKS:",
+        {
+            "has_rating_4_7": "4.7" in html,
+            "has_store_name_dkitng": "dkitng" in html.lower(),
+            "has_size_xs": bool(re.search(r'(?<![A-Za-z])XS(?![A-Za-z])', html)),
+            "has_size_s": bool(re.search(r'(?<![A-Za-z])S(?![A-Za-z])', html)),
+            "has_size_m": bool(re.search(r'(?<![A-Za-z])M(?![A-Za-z])', html)),
+            "has_size_l": bool(re.search(r'(?<![A-Za-z])L(?![A-Za-z])', html)),
+            "has_reviews_word": (
+                "reviews" in html.lower()
+                or "feedback" in html.lower()
+                or "تقييمات" in html
+            ),
+        },
+    )
+    print("HTML START:", html[:3000])
+
     if response.status_code != 200:
         raise RuntimeError(
             "ScrapingAnt failed with HTTP "
