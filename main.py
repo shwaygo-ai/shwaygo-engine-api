@@ -415,7 +415,11 @@ def fetch_supplier_html(
     )
 
     html = response.text
+with open("debug_page.html", "w", encoding="utf-8") as f:
+    f.write(html)
 
+print("HTML LENGTH:", len(html))
+print(html[:3000])
     if response.status_code != 200:
         raise RuntimeError(
             "ScrapingAnt failed with HTTP "
