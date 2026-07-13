@@ -420,16 +420,17 @@ with open("debug_page.html", "w", encoding="utf-8") as f:
 
 print("HTML LENGTH:", len(html))
 print(html[:3000])
-if response.status_code != 200:
+    if response.status_code != 200:
         raise RuntimeError(
             "ScrapingAnt failed with HTTP "
             f"{response.status_code}: {html[:700]}"
         )
 
-if not html or len(html.strip()) < 200:
+    if not html or len(html.strip()) < 200:
         raise RuntimeError(
             "ScrapingAnt returned an empty or incomplete page."
         )
+
     lowered = html.lower()
 
     service_error_terms = [
