@@ -430,7 +430,6 @@ if not html or len(html.strip()) < 200:
         raise RuntimeError(
             "ScrapingAnt returned an empty or incomplete page."
         )
-
     lowered = html.lower()
 
     service_error_terms = [
