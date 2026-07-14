@@ -1,9 +1,10 @@
-import os
 import json
+import os
 import re
 import time
 from html import unescape
-from typing import Any
+from typing import Any, Iterable
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from fastapi import FastAPI
@@ -12,12 +13,12 @@ from pydantic import BaseModel, HttpUrl
 
 
 # =========================================================
-# APP SETUP
+# SHWAYGO ENGINE V4
 # =========================================================
 
 app = FastAPI(
     title="ShwayGo Engine API",
-    version="3.1.0",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -32,65 +33,152 @@ class ScrapeRequest(BaseModel):
     url: HttpUrl
 
 
-# =========================================================
-# CONSTANTS
-# =========================================================
-
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 GEMINI_INTERACTIONS_URL = (
     "https://generativelanguage.googleapis.com/v1beta/interactions"
 )
-MAX_HTML_CHARS = 100_000
-MAX_IMAGES = 20
+
+MAX_HTML_CHARS_FOR_AI = 0
+MAX_IMAGES = 30
+MAX_VIDEOS = 10
+MAX_REVIEWS = 20
+MAX_SPECS = 80
+MAX_JSON_BLOBS = 80
+REQUEST_TIMEOUT_SCRAPER = 120
+REQUEST_TIMEOUT_GEMINI = 150
 
 
 # =========================================================
-# GENERAL HELPERS
+# BASIC HELPERS
 # =========================================================
 
 def normalize_text(value: Any) -> str:
-    """Always return a clean string, never None."""
     if value is None:
         return ""
 
     if isinstance(value, str):
-        return value.strip()
+        text = unescape(value)
+        text = text.replace("\\/", "/")
+        text = text.replace("\\u002F", "/")
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
 
-    if isinstance(value, (list, dict)):
-        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (int, float, bool)):
+        return str(value)
 
-    return str(value).strip()
+    return ""
 
 
-def clean_image_url(url: Any) -> str:
-    """Normalize supplier image URLs."""
-    if not url:
+def unique_strings(
+    values: Iterable[Any],
+    limit: int | None = None,
+) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for value in values:
+        text = normalize_text(value)
+
+        if not text:
+            continue
+
+        key = text.casefold()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(text)
+
+        if limit is not None and len(result) >= limit:
+            break
+
+    return result
+
+
+def safe_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+
+    if isinstance(value, int):
+        return max(value, 0)
+
+    if isinstance(value, float):
+        return max(int(value), 0)
+
+    text = normalize_text(value).replace(",", "")
+    match = re.search(r"\d+", text)
+
+    return int(match.group(0)) if match else 0
+
+
+def safe_rating(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+
+    try:
+        if isinstance(value, (int, float)):
+            rating = float(value)
+        else:
+            text = normalize_text(value).replace(",", ".")
+            match = re.search(r"\d+(?:\.\d+)?", text)
+
+            if not match:
+                return 0.0
+
+            rating = float(match.group(0))
+
+        if rating > 5 and rating <= 100:
+            rating = rating / 20.0
+
+        return round(max(0.0, min(rating, 5.0)), 2)
+
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def clean_url(value: Any) -> str:
+    text = normalize_text(value)
+
+    if not text:
         return ""
 
-    cleaned = unescape(str(url))
-    cleaned = cleaned.strip()
-    cleaned = cleaned.replace("\\/", "/")
-    cleaned = cleaned.replace("\\u002F", "/")
-    cleaned = cleaned.replace("&amp;", "&")
+    text = text.replace("\\u0026", "&")
+    text = text.replace("&amp;", "&")
+    text = text.strip("\"' ")
 
-    if cleaned.startswith("//"):
-        cleaned = "https:" + cleaned
-    elif cleaned.startswith("http://"):
-        cleaned = cleaned.replace("http://", "https://", 1)
+    if text.startswith("//"):
+        text = "https:" + text
+    elif text.startswith("http://"):
+        text = "https://" + text[7:]
 
-    cleaned = cleaned.rstrip("\\\"',;)]}")
+    if not text.startswith("https://"):
+        return ""
 
-    return cleaned
+    try:
+        parts = urlsplit(text)
+        clean_path = parts.path.rstrip("\\\"',;)]}")
+        return urlunsplit(
+            (
+                "https",
+                parts.netloc,
+                clean_path,
+                parts.query,
+                "",
+            )
+        )
+    except ValueError:
+        return ""
 
 
-def is_product_image(url: str) -> bool:
-    """Reject obvious icons, logos, placeholders and tracking pixels."""
+def is_image_url(url: str) -> bool:
     if not url.startswith("https://"):
         return False
 
     lowered = url.lower()
 
-    blocked_terms = [
+    blocked = (
         "favicon",
         "sprite",
         "avatar",
@@ -99,404 +187,935 @@ def is_product_image(url: str) -> bool:
         "pixel.",
         "placeholder",
         "loading.",
-        "logo.",
         "/logo/",
         "/icon/",
         "spacer.",
         "transparent.",
-    ]
+        "qrcode",
+    )
 
-    return not any(term in lowered for term in blocked_terms)
+    if any(term in lowered for term in blocked):
+        return False
 
+    image_markers = (
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+        ".avif",
+        "alicdn.com",
+        "ae01.alicdn.com",
+    )
 
-def extract_images_from_html(html: str) -> list[str]:
-    """Extract supplier product image candidates directly from HTML."""
-    patterns = [
-        r'https?:\\?/\\?/[^"\'\s<>]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"\'\s<>]*)?',
-        r'//[^"\'\s<>]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"\'\s<>]*)?',
-        r'"imageUrl"\s*:\s*"([^"]+)"',
-        r'"imagePath"\s*:\s*"([^"]+)"',
-        r'"image"\s*:\s*"([^"]+)"',
-        r'"src"\s*:\s*"([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"',
-        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
-    ]
-
-    images: list[str] = []
-
-    for pattern in patterns:
-        matches = re.findall(pattern, html, flags=re.IGNORECASE)
-
-        for match in matches:
-            candidate = match if isinstance(match, str) else match[0]
-            candidate = clean_image_url(candidate)
-
-            if (
-                candidate
-                and is_product_image(candidate)
-                and candidate not in images
-            ):
-                images.append(candidate)
-
-    return images[:MAX_IMAGES]
+    return any(marker in lowered for marker in image_markers)
 
 
-def extract_title_from_html(html: str) -> str:
-    """Extract an original supplier title without AI invention."""
-    patterns = [
-        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title',
-        r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)',
-        r"<title[^>]*>(.*?)</title>",
-    ]
+def is_video_url(url: str) -> bool:
+    lowered = url.lower()
 
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            html,
-            flags=re.IGNORECASE | re.DOTALL,
+    return (
+        url.startswith("https://")
+        and (
+            ".mp4" in lowered
+            or ".m3u8" in lowered
+            or "video" in lowered
         )
-
-        if not match:
-            continue
-
-        title = unescape(match.group(1))
-        title = re.sub(r"<[^>]+>", " ", title)
-        title = re.sub(r"\s+", " ", title).strip()
-
-        if title:
-            return title[:300]
-
-    return "Product from supplier link"
-
-
-def safe_rating(value: Any) -> float:
-    """Always return a valid rating between 0 and 5."""
-    try:
-        match = re.search(r"\d+(?:\.\d+)?", str(value or "0"))
-
-        if not match:
-            return 0.0
-
-        rating = float(match.group(0))
-        return max(0.0, min(rating, 5.0))
-
-    except (TypeError, ValueError):
-        return 0.0
+    )
 
 
 def join_lines(value: Any) -> str:
-    """Convert lists to a newline-separated Firestore String."""
     if isinstance(value, list):
-        items: list[str] = []
-
-        for item in value:
-            text = normalize_text(item)
-            if text:
-                items.append(text)
-
-        return "\n".join(items)
+        return "\n".join(unique_strings(value))
 
     return normalize_text(value)
 
 
-def format_specifications(value: Any) -> str:
-    """
-    Convert Gemini specifications into a Firestore String.
-    Accepts dictionaries or arrays of {key, value}.
-    """
-    lines: list[str] = []
-
-    if isinstance(value, dict):
-        for key, item_value in value.items():
-            key_text = normalize_text(key)
-            value_text = normalize_text(item_value)
-
-            if key_text and value_text:
-                lines.append(f"{key_text}: {value_text}")
-
-    elif isinstance(value, list):
-        for item in value:
-            if not isinstance(item, dict):
-                continue
-
-            key_text = normalize_text(
-                item.get("key")
-                or item.get("name")
-                or item.get("label")
-            )
-
-            value_text = normalize_text(
-                item.get("value")
-                or item.get("text")
-            )
-
-            if key_text and value_text:
-                lines.append(f"{key_text}: {value_text}")
-
-    elif value:
-        return normalize_text(value)
-
-    return "\n".join(lines) if lines else "Not found"
-
-
 def format_faqs(value: Any) -> str:
-    """Convert FAQ array into one Firestore String."""
     if not isinstance(value, list):
         return normalize_text(value)
 
-    items: list[str] = []
+    blocks: list[str] = []
 
     for item in value:
         if not isinstance(item, dict):
             continue
 
         question = normalize_text(
-            item.get("q") or item.get("question")
+            item.get("q")
+            or item.get("question")
         )
         answer = normalize_text(
-            item.get("a") or item.get("answer")
+            item.get("a")
+            or item.get("answer")
         )
 
-        if question or answer:
-            items.append(f"Q: {question}\nA: {answer}")
+        if question and answer:
+            blocks.append(f"Q: {question}\nA: {answer}")
 
-    return "\n\n".join(items)
+    return "\n\n".join(blocks)
 
 
-def normalize_images(
-    ai_images: Any,
-    extracted_images: list[str],
-) -> list[str]:
-    """Merge AI-selected supplier images with server-extracted images."""
-    final_images: list[str] = []
+def format_specs(specs: dict[str, str]) -> str:
+    lines: list[str] = []
 
-    if isinstance(ai_images, list):
-        for item in ai_images:
-            image_url = clean_image_url(item)
+    for key, value in specs.items():
+        key_text = normalize_text(key)
+        value_text = normalize_text(value)
 
-            if (
-                image_url
-                and is_product_image(image_url)
-                and image_url not in final_images
-            ):
-                final_images.append(image_url)
+        if key_text and value_text:
+            lines.append(f"{key_text}: {value_text}")
 
-    for image_url in extracted_images:
-        if image_url not in final_images:
-            final_images.append(image_url)
-
-    return final_images[:MAX_IMAGES]
+    return "\n".join(lines) if lines else "Not found"
 
 
 # =========================================================
-# RESPONSE BUILDERS
+# HTML / JSON EXTRACTION HELPERS
 # =========================================================
 
-def empty_product_data() -> dict[str, Any]:
-    """
-    Fixed response types for FlutterFlow.
-    No field is ever returned as null.
-    """
-    return {
-        "names": "",
-        "description": "",
-        "key_features": "",
-        "specifications": "",
-        "seo_keywords": "",
-        "faqs": "",
-        "reviews_text": "",
-        "product_rating": 0.0,
-        "images": [],
-        "videos_link": "",
-    }
-
-
-def build_fallback_data(raw_html: str) -> dict[str, Any]:
-    """Original-data fallback if Gemini is unavailable."""
-    data = empty_product_data()
-
-    data.update(
-        {
-            "names": extract_title_from_html(raw_html),
-            "description": (
-                "The supplier page was extracted successfully, "
-                "but AI content generation was temporarily unavailable. "
-                "Review and edit the original product information."
-            ),
-            "key_features": (
-                "Supplier page extracted successfully\n"
-                "Original product title collected\n"
-                "Original product images collected\n"
-                "AI content temporarily unavailable"
-            ),
-            "specifications": "Not found",
-            "seo_keywords": "",
-            "faqs": "",
-            "reviews_text": "",
-            "product_rating": 0.0,
-            "images": extract_images_from_html(raw_html),
-            "videos_link": "",
-        }
-    )
-
-    return data
-
-
-def success_response(
-    data: dict[str, Any],
-    source: str,
-    product_url: str,
-    **extra: Any,
-) -> dict[str, Any]:
-    """
-    FlutterFlow receives every field at the top level.
-    A copy remains under $.data for backward compatibility.
-    """
-    normalized = empty_product_data()
-
-    normalized.update(
-        {
-            "names": normalize_text(data.get("names")),
-            "description": normalize_text(data.get("description")),
-            "key_features": normalize_text(data.get("key_features")),
-            "specifications": normalize_text(data.get("specifications")),
-            "seo_keywords": normalize_text(data.get("seo_keywords")),
-            "faqs": normalize_text(data.get("faqs")),
-            "reviews_text": normalize_text(data.get("reviews_text")),
-            "product_rating": safe_rating(data.get("product_rating")),
-            "images": (
-                data.get("images")
-                if isinstance(data.get("images"), list)
-                else []
-            ),
-            "videos_link": normalize_text(data.get("videos_link")),
-        }
-    )
-
-    response = {
-        "status": "success",
-        "source": source,
-        "product_url": product_url,
-        **normalized,
-        "data": normalized,
-    }
-
-    response.update(extra)
-    return response
-
-
-def error_response(message: str, **extra: Any) -> dict[str, Any]:
-    response = {
-        "status": "error",
-        "message": message,
-    }
-    response.update(extra)
-    return response
-
-
-# =========================================================
-# SCRAPINGANT
-# =========================================================
-
-def fetch_supplier_html(
-    product_url: str,
-    scrapingant_key: str,
+def extract_meta_content(
+    html: str,
+    *,
+    property_name: str | None = None,
+    name: str | None = None,
 ) -> str:
-    """Fetch rendered supplier HTML using ScrapingAnt."""
-    response = requests.get(
-        "https://api.scrapingant.com/v2/general",
-        params={
-            "url": product_url,
-            "x-api-key": scrapingant_key,
-            "browser": "true",
-        },
-        timeout=120,
-    )
-
-    html = response.text
-
-    # Temporary diagnostics shown in Render Logs.
-    print("HTML LENGTH:", len(html))
-    print(
-        "HTML CHECKS:",
-        {
-            "has_rating_4_7": "4.7" in html,
-            "has_store_name_dkitng": "dkitng" in html.lower(),
-            "has_size_xs": bool(re.search(r'(?<![A-Za-z])XS(?![A-Za-z])', html)),
-            "has_size_s": bool(re.search(r'(?<![A-Za-z])S(?![A-Za-z])', html)),
-            "has_size_m": bool(re.search(r'(?<![A-Za-z])M(?![A-Za-z])', html)),
-            "has_size_l": bool(re.search(r'(?<![A-Za-z])L(?![A-Za-z])', html)),
-            "has_reviews_word": (
-                "reviews" in html.lower()
-                or "feedback" in html.lower()
-                or "تقييمات" in html
+    if property_name:
+        patterns = [
+            (
+                rf'<meta[^>]+property=["\']{re.escape(property_name)}'
+                rf'["\'][^>]+content=["\']([^"\']+)'
             ),
-        },
-    )
-    print("HTML START:", html[:3000])
+            (
+                rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+'
+                rf'property=["\']{re.escape(property_name)}["\']'
+            ),
+        ]
+    elif name:
+        patterns = [
+            (
+                rf'<meta[^>]+name=["\']{re.escape(name)}'
+                rf'["\'][^>]+content=["\']([^"\']+)'
+            ),
+            (
+                rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+'
+                rf'name=["\']{re.escape(name)}["\']'
+            ),
+        ]
+    else:
+        return ""
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            "ScrapingAnt failed with HTTP "
-            f"{response.status_code}: {html[:700]}"
-        )
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.IGNORECASE)
 
-    if not html or len(html.strip()) < 200:
-        raise RuntimeError(
-            "ScrapingAnt returned an empty or incomplete page."
-        )
+        if match:
+            return normalize_text(match.group(1))
 
-    lowered = html.lower()
+    return ""
 
-    service_error_terms = [
-        "zenrows web scraping api",
-        "trial expired",
-        "auth005",
-        "missing api token",
-        "invalid api token",
-        "subscription expired",
-        "payment required",
+
+def extract_title_from_html(html: str) -> str:
+    candidates = [
+        extract_meta_content(html, property_name="og:title"),
+        extract_meta_content(html, name="twitter:title"),
     ]
 
-    if any(term in lowered for term in service_error_terms):
-        raise RuntimeError(
-            "The scraper returned a service/error page "
-            "instead of the supplier product page."
-        )
+    title_match = re.search(
+        r"<title[^>]*>(.*?)</title>",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
-    return html[:MAX_HTML_CHARS]
+    if title_match:
+        candidates.append(title_match.group(1))
+
+    for candidate in candidates:
+        title = normalize_text(candidate)
+
+        if title:
+            return title[:500]
+
+    return "Product from supplier link"
+
+
+def balanced_json_slice(
+    text: str,
+    start_index: int,
+) -> str:
+    if start_index < 0 or start_index >= len(text):
+        return ""
+
+    opening = text[start_index]
+
+    if opening not in "[{":
+        return ""
+
+    closing = "}" if opening == "{" else "]"
+    depth = 0
+    in_string = False
+    escape = False
+
+    for index in range(start_index, len(text)):
+        char = text[index]
+
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+
+            if depth == 0:
+                return text[start_index:index + 1]
+
+    return ""
+
+
+def parse_json_text(text: str) -> Any:
+    cleaned = text.strip().rstrip(";")
+
+    if not cleaned:
+        return None
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    cleaned = cleaned.replace("\\x2F", "/")
+    cleaned = cleaned.replace("\\u002F", "/")
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+
+
+def extract_json_blobs(html: str) -> list[Any]:
+    blobs: list[Any] = []
+    seen: set[str] = set()
+
+    script_pattern = re.compile(
+        r"<script\b[^>]*>(.*?)</script>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in script_pattern.finditer(html):
+        body = match.group(1).strip()
+
+        if not body:
+            continue
+
+        candidates: list[str] = []
+
+        if body.startswith("{") or body.startswith("["):
+            candidates.append(body)
+
+        for marker in (
+            "window.runParams",
+            "window._dida_config_",
+            "window.__INITIAL_STATE__",
+            "window.__PRELOADED_STATE__",
+            "window.pageData",
+            "window.data",
+            "runParams",
+            "data:",
+            "data =",
+        ):
+            marker_index = body.find(marker)
+
+            if marker_index == -1:
+                continue
+
+            brace_indexes = [
+                index
+                for index in (
+                    body.find("{", marker_index),
+                    body.find("[", marker_index),
+                )
+                if index != -1
+            ]
+
+            if not brace_indexes:
+                continue
+
+            start = min(brace_indexes)
+            candidate = balanced_json_slice(body, start)
+
+            if candidate:
+                candidates.append(candidate)
+
+        for candidate in candidates:
+            if len(candidate) < 2:
+                continue
+
+            signature = candidate[:200] + str(len(candidate))
+
+            if signature in seen:
+                continue
+
+            parsed = parse_json_text(candidate)
+
+            if parsed is None:
+                continue
+
+            seen.add(signature)
+            blobs.append(parsed)
+
+            if len(blobs) >= MAX_JSON_BLOBS:
+                return blobs
+
+    return blobs
+
+
+def walk_json(
+    value: Any,
+    path: tuple[str, ...] = (),
+) -> Iterable[tuple[tuple[str, ...], Any]]:
+    yield path, value
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield from walk_json(
+                child,
+                path + (str(key),),
+            )
+
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from walk_json(
+                child,
+                path + (str(index),),
+            )
+
+
+def path_text(path: tuple[str, ...]) -> str:
+    return ".".join(path).lower()
+
+
+def all_walked(blobs: list[Any]) -> list[tuple[tuple[str, ...], Any]]:
+    walked: list[tuple[tuple[str, ...], Any]] = []
+
+    for blob in blobs:
+        walked.extend(walk_json(blob))
+
+    return walked
 
 
 # =========================================================
-# GEMINI
+# ORIGINAL PRODUCT EXTRACTION
 # =========================================================
 
-def gemini_response_schema() -> dict[str, Any]:
-    """
-    Standard JSON Schema for Gemini structured output.
-    Lowercase JSON Schema types are used intentionally.
-    """
+TITLE_KEYS = {
+    "subject",
+    "producttitle",
+    "product_title",
+    "itemtitle",
+    "item_title",
+    "title",
+    "name",
+}
+
+RATING_KEYS = {
+    "ratingvalue",
+    "rating_value",
+    "averagestar",
+    "average_star",
+    "averageRating",
+    "evaluationaverage",
+    "evaluation_average",
+    "star",
+    "stars",
+    "rating",
+}
+
+REVIEW_COUNT_KEYS = {
+    "reviewcount",
+    "review_count",
+    "feedbackcount",
+    "feedback_count",
+    "evaluationcount",
+    "evaluation_count",
+    "totalreviews",
+    "total_reviews",
+}
+
+IMAGE_KEY_MARKERS = (
+    "image",
+    "img",
+    "pic",
+    "photo",
+)
+
+VIDEO_KEY_MARKERS = (
+    "video",
+    "mediaurl",
+    "media_url",
+)
+
+SPEC_NAME_KEYS = (
+    "attrname",
+    "attributename",
+    "propname",
+    "propertyname",
+    "specname",
+    "skuPropertyName",
+    "name",
+    "key",
+    "label",
+)
+
+SPEC_VALUE_KEYS = (
+    "attrvalue",
+    "attributevalue",
+    "propvalue",
+    "propertyvalue",
+    "specvalue",
+    "value",
+    "text",
+)
+
+OPTION_GROUP_KEYS = (
+    "skuPropertyName",
+    "propertyName",
+    "propName",
+    "attributeName",
+    "name",
+)
+
+OPTION_VALUE_KEYS = (
+    "propertyValueDisplayName",
+    "skuPropertyValueDisplayName",
+    "propertyValueName",
+    "displayName",
+    "value",
+    "name",
+)
+
+
+def extract_original_name(
+    html: str,
+    walked: list[tuple[tuple[str, ...], Any]],
+) -> str:
+    meta_title = extract_title_from_html(html)
+
+    candidates: list[str] = [meta_title]
+
+    for path, value in walked:
+        if not path or not isinstance(value, str):
+            continue
+
+        key = path[-1].lower()
+        text = normalize_text(value)
+
+        if key not in {item.lower() for item in TITLE_KEYS}:
+            continue
+
+        if len(text) < 10 or len(text) > 500:
+            continue
+
+        lowered_path = path_text(path)
+
+        if any(
+            blocked in lowered_path
+            for blocked in (
+                "store",
+                "seller",
+                "category",
+                "breadcrumb",
+                "review",
+                "seo",
+            )
+        ):
+            continue
+
+        candidates.append(text)
+
+    candidates = unique_strings(candidates)
+
+    if not candidates:
+        return "Product from supplier link"
+
+    return max(candidates, key=len)[:500]
+
+
+def extract_images(
+    html: str,
+    walked: list[tuple[tuple[str, ...], Any]],
+) -> list[str]:
+    candidates: list[str] = []
+
+    meta_image = extract_meta_content(
+        html,
+        property_name="og:image",
+    )
+
+    if meta_image:
+        candidates.append(meta_image)
+
+    url_pattern = re.compile(
+        r'(?:https?:)?//[^"\'\s<>\\]+?'
+        r'(?:\.jpg|\.jpeg|\.png|\.webp|\.avif)'
+        r'(?:\?[^"\'\s<>\\]*)?',
+        flags=re.IGNORECASE,
+    )
+
+    candidates.extend(url_pattern.findall(html))
+
+    for path, value in walked:
+        current_path = path_text(path)
+
+        if not any(marker in current_path for marker in IMAGE_KEY_MARKERS):
+            continue
+
+        if isinstance(value, str):
+            candidates.append(value)
+
+        elif isinstance(value, list):
+            candidates.extend(
+                item
+                for item in value
+                if isinstance(item, str)
+            )
+
+    cleaned: list[str] = []
+
+    for candidate in candidates:
+        url = clean_url(candidate)
+
+        if url and is_image_url(url):
+            cleaned.append(url)
+
+    return unique_strings(cleaned, MAX_IMAGES)
+
+
+def extract_videos(
+    html: str,
+    walked: list[tuple[tuple[str, ...], Any]],
+) -> list[str]:
+    candidates: list[str] = []
+
+    video_pattern = re.compile(
+        r'(?:https?:)?//[^"\'\s<>\\]+?'
+        r'(?:\.mp4|\.m3u8)'
+        r'(?:\?[^"\'\s<>\\]*)?',
+        flags=re.IGNORECASE,
+    )
+
+    candidates.extend(video_pattern.findall(html))
+
+    for path, value in walked:
+        current_path = path_text(path)
+
+        if not any(marker in current_path for marker in VIDEO_KEY_MARKERS):
+            continue
+
+        if isinstance(value, str):
+            candidates.append(value)
+
+        elif isinstance(value, list):
+            candidates.extend(
+                item
+                for item in value
+                if isinstance(item, str)
+            )
+
+    cleaned: list[str] = []
+
+    for candidate in candidates:
+        url = clean_url(candidate)
+
+        if url and is_video_url(url):
+            cleaned.append(url)
+
+    return unique_strings(cleaned, MAX_VIDEOS)
+
+
+def extract_rating(
+    html: str,
+    walked: list[tuple[tuple[str, ...], Any]],
+) -> float:
+    candidates: list[float] = []
+
+    for path, value in walked:
+        if not path:
+            continue
+
+        key = path[-1].lower()
+
+        if key not in {item.lower() for item in RATING_KEYS}:
+            continue
+
+        rating = safe_rating(value)
+
+        if rating > 0:
+            candidates.append(rating)
+
+    for pattern in (
+        r'"ratingValue"\s*:\s*"?(\d+(?:\.\d+)?)',
+        r'"averageStar"\s*:\s*"?(\d+(?:\.\d+)?)',
+        r'"evaluationAverage"\s*:\s*"?(\d+(?:\.\d+)?)',
+        r'(\d+(?:\.\d+)?)\s*(?:out of 5|/5)',
+    ):
+        for match in re.findall(pattern, html, flags=re.IGNORECASE):
+            rating = safe_rating(match)
+
+            if rating > 0:
+                candidates.append(rating)
+
+    if not candidates:
+        return 0.0
+
+    realistic = [
+        value
+        for value in candidates
+        if 1.0 <= value <= 5.0
+    ]
+
+    return max(realistic) if realistic else 0.0
+
+
+def extract_review_count(
+    html: str,
+    walked: list[tuple[tuple[str, ...], Any]],
+) -> int:
+    candidates: list[int] = []
+
+    for path, value in walked:
+        if not path:
+            continue
+
+        key = path[-1].lower()
+
+        if key not in {
+            item.lower()
+            for item in REVIEW_COUNT_KEYS
+        }:
+            continue
+
+        count = safe_int(value)
+
+        if count > 0:
+            candidates.append(count)
+
+    for pattern in (
+        r'"reviewCount"\s*:\s*"?(\d+)',
+        r'"feedbackCount"\s*:\s*"?(\d+)',
+        r'"evaluationCount"\s*:\s*"?(\d+)',
+        r'(\d+)\s+(?:reviews?|ratings?)',
+    ):
+        for match in re.findall(pattern, html, flags=re.IGNORECASE):
+            count = safe_int(match)
+
+            if count > 0:
+                candidates.append(count)
+
+    return max(candidates) if candidates else 0
+
+
+def extract_reviews(
+    walked: list[tuple[tuple[str, ...], Any]],
+) -> list[str]:
+    candidates: list[str] = []
+
+    for path, value in walked:
+        if not isinstance(value, str):
+            continue
+
+        current_path = path_text(path)
+
+        if not any(
+            marker in current_path
+            for marker in (
+                "review",
+                "feedback",
+                "evaluation",
+            )
+        ):
+            continue
+
+        if not any(
+            marker in current_path
+            for marker in (
+                "content",
+                "comment",
+                "text",
+                "body",
+                "buyerfeedback",
+            )
+        ):
+            continue
+
+        text = normalize_text(value)
+
+        if 15 <= len(text) <= 1500:
+            candidates.append(text)
+
+    return unique_strings(candidates, MAX_REVIEWS)
+
+
+def extract_specs_from_dict(
+    node: dict[str, Any],
+) -> tuple[str, str] | None:
+    lowered = {
+        str(key).lower(): value
+        for key, value in node.items()
+    }
+
+    name_value = None
+    spec_value = None
+
+    for key in SPEC_NAME_KEYS:
+        candidate = lowered.get(key.lower())
+
+        if candidate is not None:
+            name_value = candidate
+            break
+
+    for key in SPEC_VALUE_KEYS:
+        candidate = lowered.get(key.lower())
+
+        if candidate is not None:
+            spec_value = candidate
+            break
+
+    name = normalize_text(name_value)
+
+    if isinstance(spec_value, list):
+        value = ", ".join(unique_strings(spec_value))
+    else:
+        value = normalize_text(spec_value)
+
+    if (
+        name
+        and value
+        and name.casefold() != value.casefold()
+        and len(name) <= 100
+        and len(value) <= 500
+    ):
+        return name, value
+
+    return None
+
+
+def extract_option_groups(
+    walked: list[tuple[tuple[str, ...], Any]],
+) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+
+    for _, value in walked:
+        if not isinstance(value, dict):
+            continue
+
+        group_name = ""
+
+        for key in OPTION_GROUP_KEYS:
+            if key in value:
+                group_name = normalize_text(value.get(key))
+                break
+
+        if not group_name:
+            continue
+
+        values: list[str] = []
+
+        for child_key in (
+            "skuPropertyValues",
+            "propertyValues",
+            "values",
+            "options",
+        ):
+            child = value.get(child_key)
+
+            if not isinstance(child, list):
+                continue
+
+            for item in child:
+                if isinstance(item, str):
+                    values.append(item)
+                    continue
+
+                if not isinstance(item, dict):
+                    continue
+
+                for value_key in OPTION_VALUE_KEYS:
+                    if value_key in item:
+                        values.append(item.get(value_key))
+                        break
+
+        values = unique_strings(values)
+
+        if values:
+            groups.setdefault(group_name, [])
+            groups[group_name].extend(values)
+            groups[group_name] = unique_strings(
+                groups[group_name]
+            )
+
+    return groups
+
+
+def classify_option_groups(
+    groups: dict[str, list[str]],
+) -> tuple[list[str], list[str]]:
+    colors: list[str] = []
+    sizes: list[str] = []
+
+    for group_name, values in groups.items():
+        lowered = group_name.lower()
+
+        if any(
+            marker in lowered
+            for marker in (
+                "color",
+                "colour",
+                "لون",
+            )
+        ):
+            colors.extend(values)
+
+        if any(
+            marker in lowered
+            for marker in (
+                "size",
+                "مقاس",
+            )
+        ):
+            sizes.extend(values)
+
+    return unique_strings(colors), unique_strings(sizes)
+
+
+def extract_specs(
+    walked: list[tuple[tuple[str, ...], Any]],
+    colors: list[str],
+    sizes: list[str],
+) -> dict[str, str]:
+    specs: dict[str, str] = {}
+
+    for _, value in walked:
+        if not isinstance(value, dict):
+            continue
+
+        pair = extract_specs_from_dict(value)
+
+        if not pair:
+            continue
+
+        key, item_value = pair
+
+        if key not in specs:
+            specs[key] = item_value
+
+        if len(specs) >= MAX_SPECS:
+            break
+
+    if colors:
+        specs.setdefault("Colors", ", ".join(colors))
+
+    if sizes:
+        specs.setdefault("Sizes", ", ".join(sizes))
+
+    return specs
+
+
+def extract_named_spec(
+    specs: dict[str, str],
+    keywords: tuple[str, ...],
+) -> str:
+    for key, value in specs.items():
+        lowered = key.lower()
+
+        if any(keyword in lowered for keyword in keywords):
+            return value
+
+    return ""
+
+
+def extract_original_product(
+    html: str,
+) -> dict[str, Any]:
+    blobs = extract_json_blobs(html)
+    walked = all_walked(blobs)
+    option_groups = extract_option_groups(walked)
+    colors, sizes = classify_option_groups(option_groups)
+    specs = extract_specs(walked, colors, sizes)
+
+    product = {
+        "name": extract_original_name(html, walked),
+        "specifications": specs,
+        "specifications_text": format_specs(specs),
+        "colors": colors,
+        "sizes": sizes,
+        "material": extract_named_spec(
+            specs,
+            (
+                "material",
+                "fabric",
+                "composition",
+                "الخامة",
+            ),
+        ),
+        "brand": extract_named_spec(
+            specs,
+            (
+                "brand",
+                "ماركة",
+                "العلامة",
+            ),
+        ),
+        "country_of_origin": extract_named_spec(
+            specs,
+            (
+                "origin",
+                "country",
+                "place of origin",
+                "بلد",
+                "المنشأ",
+            ),
+        ),
+        "rating": extract_rating(html, walked),
+        "review_count": extract_review_count(
+            html,
+            walked,
+        ),
+        "reviews": extract_reviews(walked),
+        "images": extract_images(html, walked),
+        "videos": extract_videos(html, walked),
+        "option_groups": option_groups,
+        "json_blobs_found": len(blobs),
+    }
+
+    return product
+
+
+# =========================================================
+# AI CONTENT
+# =========================================================
+
+def ai_response_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "name": {"type": "string"},
-            "description": {"type": "string"},
+            "name": {
+                "type": "string",
+            },
+            "description": {
+                "type": "string",
+            },
             "features": {
                 "type": "array",
                 "items": {"type": "string"},
-            },
-            "specifications": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string"},
-                        "value": {"type": "string"},
-                    },
-                    "required": ["key", "value"],
-                    "additionalProperties": False,
-                },
             },
             "seo_keywords": {
                 "type": "array",
@@ -514,20 +1133,15 @@ def gemini_response_schema() -> dict[str, Any]:
                     "additionalProperties": False,
                 },
             },
-            "reviews": {
+            "selling_angles": {
                 "type": "array",
                 "items": {"type": "string"},
             },
-            "rating": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 5,
-            },
-            "images": {
+            "hooks": {
                 "type": "array",
                 "items": {"type": "string"},
             },
-            "videos": {
+            "ctas": {
                 "type": "array",
                 "items": {"type": "string"},
             },
@@ -536,33 +1150,79 @@ def gemini_response_schema() -> dict[str, Any]:
             "name",
             "description",
             "features",
-            "specifications",
             "seo_keywords",
             "faqs",
-            "reviews",
-            "rating",
-            "images",
-            "videos",
+            "selling_angles",
+            "hooks",
+            "ctas",
         ],
         "additionalProperties": False,
     }
 
 
+def build_ai_prompt(
+    original: dict[str, Any],
+) -> str:
+    safe_original = {
+        "name": original.get("name", ""),
+        "specifications": original.get(
+            "specifications",
+            {},
+        ),
+        "colors": original.get("colors", []),
+        "sizes": original.get("sizes", []),
+        "material": original.get("material", ""),
+        "brand": original.get("brand", ""),
+        "country_of_origin": original.get(
+            "country_of_origin",
+            "",
+        ),
+        "rating": original.get("rating", 0),
+        "review_count": original.get(
+            "review_count",
+            0,
+        ),
+    }
+
+    return f"""
+You are ShwayGo Engine AI.
+
+Create premium e-commerce marketing content using ONLY the verified
+supplier facts supplied below.
+
+STRICT RULES:
+1. Never invent a color, size, material, brand, origin, rating,
+   review, image, video, dimension, certification, or product feature.
+2. You may rewrite and improve the product name.
+3. The description must be persuasive, clear, search-friendly,
+   and based only on verified facts.
+4. Generate 5 to 8 concise key features.
+5. Generate 12 to 20 useful SEO keyword phrases.
+6. Generate 5 useful FAQs with factual answers.
+7. Generate 3 to 6 selling angles.
+8. Generate 5 short advertising hooks.
+9. Generate 3 clear calls to action.
+10. Return JSON only and follow the schema exactly.
+11. If very few supplier facts are available, remain conservative
+    and do not fill gaps with assumptions.
+
+VERIFIED ORIGINAL PRODUCT DATA:
+{json.dumps(safe_original, ensure_ascii=False)}
+""".strip()
+
+
 def extract_google_error(response_data: Any) -> str:
-    """Return a readable Gemini error without exposing the API key."""
     if isinstance(response_data, dict):
         error = response_data.get("error")
 
         if isinstance(error, dict):
-            code = normalize_text(error.get("code"))
-            status = normalize_text(error.get("status"))
-            message = normalize_text(error.get("message"))
-
-            parts = [
-                part
-                for part in [code, status, message]
-                if part
-            ]
+            parts = unique_strings(
+                [
+                    error.get("code"),
+                    error.get("status"),
+                    error.get("message"),
+                ]
+            )
 
             if parts:
                 return " | ".join(parts)
@@ -575,33 +1235,25 @@ def extract_google_error(response_data: Any) -> str:
     return normalize_text(response_data)[:1500]
 
 
-def extract_interaction_text(response_data: dict[str, Any]) -> str:
-    """Extract text from the Interactions API steps response."""
-    steps = response_data.get("steps", [])
-
-    if not isinstance(steps, list):
-        return ""
-
+def extract_interaction_text(
+    response_data: dict[str, Any],
+) -> str:
     text_parts: list[str] = []
 
-    for step in steps:
+    for step in response_data.get("steps", []):
         if not isinstance(step, dict):
             continue
 
         if step.get("type") != "model_output":
             continue
 
-        content = step.get("content", [])
-
-        if not isinstance(content, list):
-            continue
-
-        for item in content:
+        for item in step.get("content", []):
             if not isinstance(item, dict):
                 continue
 
             if item.get("type") == "text":
                 text = normalize_text(item.get("text"))
+
                 if text:
                     text_parts.append(text)
 
@@ -609,7 +1261,6 @@ def extract_interaction_text(response_data: dict[str, Any]) -> str:
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
-    """Parse Gemini JSON safely and require a top-level object."""
     cleaned = normalize_text(text)
     cleaned = cleaned.replace("```json", "")
     cleaned = cleaned.replace("```JSON", "")
@@ -622,19 +1273,19 @@ def parse_json_object(text: str) -> dict[str, Any]:
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        first_brace = cleaned.find("{")
-        last_brace = cleaned.rfind("}")
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
 
-        if first_brace == -1 or last_brace == -1:
+        if start == -1 or end == -1:
             raise RuntimeError(
-                "Gemini response did not contain a JSON object."
+                "Gemini response did not contain JSON."
             )
 
-        parsed = json.loads(cleaned[first_brace:last_brace + 1])
+        parsed = json.loads(cleaned[start:end + 1])
 
     if not isinstance(parsed, dict):
         raise RuntimeError(
-            "Gemini JSON output was not an object."
+            "Gemini output was not a JSON object."
         )
 
     return parsed
@@ -642,27 +1293,26 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 def call_gemini(
     api_key: str,
-    prompt: str,
+    original: dict[str, Any],
 ) -> tuple[dict[str, Any], str]:
-    """
-    Call the official Gemini Interactions API with retries.
-    Returns: (parsed_json, model_used)
-    """
     model = (
-        os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
+        os.environ.get(
+            "GEMINI_MODEL",
+            DEFAULT_GEMINI_MODEL,
+        ).strip()
         or DEFAULT_GEMINI_MODEL
     )
 
     payload = {
         "model": model,
-        "input": prompt,
+        "input": build_ai_prompt(original),
         "response_format": {
             "type": "text",
             "mime_type": "application/json",
-            "schema": gemini_response_schema(),
+            "schema": ai_response_schema(),
         },
         "generation_config": {
-            "temperature": 0.15,
+            "temperature": 0.2,
             "thinking_level": "low",
             "max_output_tokens": 8192,
         },
@@ -680,7 +1330,7 @@ def call_gemini(
                     "x-goog-api-key": api_key,
                 },
                 json=payload,
-                timeout=150,
+                timeout=REQUEST_TIMEOUT_GEMINI,
             )
 
             try:
@@ -693,21 +1343,25 @@ def call_gemini(
             if response.status_code == 200:
                 if not isinstance(response_data, dict):
                     raise RuntimeError(
-                        "Gemini returned an invalid response object."
+                        "Gemini returned an invalid object."
                     )
 
-                status = normalize_text(response_data.get("status"))
+                status = normalize_text(
+                    response_data.get("status")
+                )
 
                 if status and status != "completed":
                     raise RuntimeError(
-                        f"Gemini interaction status was {status}."
+                        f"Gemini status was {status}."
                     )
 
-                output_text = extract_interaction_text(response_data)
+                output_text = extract_interaction_text(
+                    response_data
+                )
 
                 if not output_text:
                     raise RuntimeError(
-                        "Gemini returned no model_output text."
+                        "Gemini returned no output text."
                     )
 
                 return parse_json_object(output_text), model
@@ -724,10 +1378,9 @@ def call_gemini(
                 502,
                 503,
                 504,
-            }:
-                if attempt < 3:
-                    time.sleep(attempt * 3)
-                    continue
+            } and attempt < 3:
+                time.sleep(attempt * 3)
+                continue
 
             break
 
@@ -751,116 +1404,332 @@ def call_gemini(
     )
 
 
-def build_gemini_prompt(
-    raw_html: str,
-    original_title: str,
-    original_images: list[str],
-) -> str:
-    """Build a fact-preserving product extraction prompt."""
-    return f"""
-You are ShwayGo Engine, a professional e-commerce product preparation system.
-
-Your responsibilities:
-
-A) Preserve original supplier facts.
-B) Create high-quality marketing content only from verified facts.
-
-STRICT RULES:
-
-1. Do not invent colors, sizes, materials, country of origin,
-   dimensions, ratings, reviews, images, or videos.
-
-2. Original facts must come only from the supplied HTML or from the
-   server-extracted title and image URLs below.
-
-3. If an original fact is missing:
-   - return an empty array for lists,
-   - return an empty string for text,
-   - return 0 for rating,
-   - or return a specification item whose value is "Not found"
-     only when a specification category exists but its value is unavailable.
-
-4. You may improve:
-   - product title,
-   - marketing description,
-   - selling features,
-   - SEO keywords,
-   - FAQ wording.
-
-5. Reviews must be extracted from the supplier page only.
-   Never create fake customer reviews.
-
-6. Images must be supplier product image URLs only.
-
-7. Videos must be supplier video URLs only.
-   Never invent a video URL.
-
-8. Return valid JSON matching the required schema only.
-
-SERVER-EXTRACTED ORIGINAL TITLE:
-{original_title}
-
-SERVER-EXTRACTED IMAGE URLS:
-{json.dumps(original_images, ensure_ascii=False)}
-
-SUPPLIER HTML:
-{raw_html}
-""".strip()
-
-
-def normalize_gemini_data(
-    gemini_data: dict[str, Any],
-    original_title: str,
-    extracted_images: list[str],
+def normalize_ai_data(
+    value: dict[str, Any],
+    original_name: str,
 ) -> dict[str, Any]:
-    """Convert Gemini output to the exact FlutterFlow field types."""
-    data = empty_product_data()
-    seo_keywords = gemini_data.get("seo_keywords", [])
-
-    data.update(
-        {
-            "names": (
-                normalize_text(gemini_data.get("name"))
-                or original_title
-            ),
-            "description": normalize_text(
-                gemini_data.get("description")
-            ),
-            "key_features": join_lines(
-                gemini_data.get("features")
-            ),
-            "specifications": format_specifications(
-                gemini_data.get("specifications")
-            ),
-            "seo_keywords": (
-                ", ".join(
-                    normalize_text(item)
-                    for item in seo_keywords
-                    if normalize_text(item)
-                )
-                if isinstance(seo_keywords, list)
-                else normalize_text(seo_keywords)
-            ),
-            "faqs": format_faqs(
-                gemini_data.get("faqs")
-            ),
-            "reviews_text": join_lines(
-                gemini_data.get("reviews")
-            ),
-            "product_rating": safe_rating(
-                gemini_data.get("rating")
-            ),
-            "images": normalize_images(
-                gemini_data.get("images"),
-                extracted_images,
-            ),
-            "videos_link": join_lines(
-                gemini_data.get("videos")
-            ),
-        }
+    seo_keywords = unique_strings(
+        value.get("seo_keywords", []),
+        30,
     )
 
-    return data
+    if not seo_keywords:
+        fallback_terms = unique_strings(
+            re.findall(
+                r"[A-Za-z0-9][A-Za-z0-9\-]{2,}",
+                original_name,
+            ),
+            12,
+        )
+        seo_keywords = fallback_terms
+
+    return {
+        "name": (
+            normalize_text(value.get("name"))
+            or original_name
+        ),
+        "description": normalize_text(
+            value.get("description")
+        ),
+        "key_features": unique_strings(
+            value.get("features", []),
+            10,
+        ),
+        "seo_keywords": seo_keywords,
+        "faqs": (
+            value.get("faqs")
+            if isinstance(value.get("faqs"), list)
+            else []
+        ),
+        "selling_angles": unique_strings(
+            value.get("selling_angles", []),
+            10,
+        ),
+        "hooks": unique_strings(
+            value.get("hooks", []),
+            10,
+        ),
+        "ctas": unique_strings(
+            value.get("ctas", []),
+            10,
+        ),
+    }
+
+
+def fallback_ai_data(
+    original: dict[str, Any],
+) -> dict[str, Any]:
+    name = normalize_text(original.get("name"))
+
+    return {
+        "name": name,
+        "description": "",
+        "key_features": [],
+        "seo_keywords": unique_strings(
+            re.findall(
+                r"[A-Za-z0-9][A-Za-z0-9\-]{2,}",
+                name,
+            ),
+            12,
+        ),
+        "faqs": [],
+        "selling_angles": [],
+        "hooks": [],
+        "ctas": [],
+    }
+
+
+# =========================================================
+# SCRAPINGANT
+# =========================================================
+
+def fetch_supplier_html(
+    product_url: str,
+    scrapingant_key: str,
+) -> str:
+    response = requests.get(
+        "https://api.scrapingant.com/v2/general",
+        params={
+            "url": product_url,
+            "x-api-key": scrapingant_key,
+            "browser": "true",
+        },
+        timeout=REQUEST_TIMEOUT_SCRAPER,
+    )
+
+    html = response.text
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            "ScrapingAnt failed with HTTP "
+            f"{response.status_code}: {html[:700]}"
+        )
+
+    if not html or len(html.strip()) < 200:
+        raise RuntimeError(
+            "ScrapingAnt returned an empty or incomplete page."
+        )
+
+    lowered = html.lower()
+
+    service_error_terms = (
+        "zenrows web scraping api",
+        "trial expired",
+        "auth005",
+        "missing api token",
+        "invalid api token",
+        "subscription expired",
+        "payment required",
+    )
+
+    if any(term in lowered for term in service_error_terms):
+        raise RuntimeError(
+            "The scraper returned a service error page."
+        )
+
+    debug_html = (
+        os.environ.get("DEBUG_HTML", "false")
+        .strip()
+        .lower()
+        in {"1", "true", "yes"}
+    )
+
+    if debug_html:
+        print("HTML LENGTH:", len(html))
+        print(
+            "HTML CHECKS:",
+            {
+                "has_rating_word": "rating" in lowered,
+                "has_reviews_word": (
+                    "review" in lowered
+                    or "feedback" in lowered
+                ),
+                "has_sku_word": "sku" in lowered,
+                "has_size_word": "size" in lowered,
+                "has_color_word": (
+                    "color" in lowered
+                    or "colour" in lowered
+                ),
+            },
+        )
+        print("HTML START:", html[:3000])
+
+    return html
+
+
+# =========================================================
+# RESPONSE BUILDERS
+# =========================================================
+
+def compatibility_fields(
+    original: dict[str, Any],
+    ai: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "names": normalize_text(original.get("name")),
+        "description": normalize_text(ai.get("description")),
+        "key_features": join_lines(
+            ai.get("key_features", [])
+        ),
+        "specifications": normalize_text(
+            original.get("specifications_text")
+        ),
+        "seo_keywords": ", ".join(
+            unique_strings(ai.get("seo_keywords", []))
+        ),
+        "faqs": format_faqs(ai.get("faqs", [])),
+        "reviews_text": join_lines(
+            original.get("reviews", [])
+        ),
+        "product_rating": safe_rating(
+            original.get("rating")
+        ),
+        "images": (
+            original.get("images")
+            if isinstance(original.get("images"), list)
+            else []
+        ),
+        "videos_link": join_lines(
+            original.get("videos", [])
+        ),
+    }
+
+
+def success_response(
+    product_url: str,
+    original: dict[str, Any],
+    ai: dict[str, Any],
+    source: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    legacy = compatibility_fields(original, ai)
+
+    response = {
+        "status": "success",
+        "source": source,
+        "product_url": product_url,
+
+        # Current FlutterFlow compatibility.
+        **legacy,
+        "data": legacy,
+
+        # New clean separation.
+        "original": {
+            "name": normalize_text(
+                original.get("name")
+            ),
+            "specifications": (
+                original.get("specifications")
+                if isinstance(
+                    original.get("specifications"),
+                    dict,
+                )
+                else {}
+            ),
+            "specifications_text": normalize_text(
+                original.get("specifications_text")
+            ),
+            "colors": (
+                original.get("colors")
+                if isinstance(original.get("colors"), list)
+                else []
+            ),
+            "sizes": (
+                original.get("sizes")
+                if isinstance(original.get("sizes"), list)
+                else []
+            ),
+            "material": normalize_text(
+                original.get("material")
+            ),
+            "brand": normalize_text(
+                original.get("brand")
+            ),
+            "country_of_origin": normalize_text(
+                original.get("country_of_origin")
+            ),
+            "rating": safe_rating(
+                original.get("rating")
+            ),
+            "review_count": safe_int(
+                original.get("review_count")
+            ),
+            "reviews": (
+                original.get("reviews")
+                if isinstance(original.get("reviews"), list)
+                else []
+            ),
+            "images": (
+                original.get("images")
+                if isinstance(original.get("images"), list)
+                else []
+            ),
+            "videos": (
+                original.get("videos")
+                if isinstance(original.get("videos"), list)
+                else []
+            ),
+            "option_groups": (
+                original.get("option_groups")
+                if isinstance(
+                    original.get("option_groups"),
+                    dict,
+                )
+                else {}
+            ),
+        },
+        "ai": {
+            "name": normalize_text(ai.get("name")),
+            "description": normalize_text(
+                ai.get("description")
+            ),
+            "key_features": (
+                ai.get("key_features")
+                if isinstance(ai.get("key_features"), list)
+                else []
+            ),
+            "seo_keywords": (
+                ai.get("seo_keywords")
+                if isinstance(ai.get("seo_keywords"), list)
+                else []
+            ),
+            "faqs": (
+                ai.get("faqs")
+                if isinstance(ai.get("faqs"), list)
+                else []
+            ),
+            "selling_angles": (
+                ai.get("selling_angles")
+                if isinstance(ai.get("selling_angles"), list)
+                else []
+            ),
+            "hooks": (
+                ai.get("hooks")
+                if isinstance(ai.get("hooks"), list)
+                else []
+            ),
+            "ctas": (
+                ai.get("ctas")
+                if isinstance(ai.get("ctas"), list)
+                else []
+            ),
+        },
+    }
+
+    response.update(extra)
+    return response
+
+
+def error_response(
+    message: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    response = {
+        "status": "error",
+        "message": message,
+    }
+    response.update(extra)
+    return response
 
 
 # =========================================================
@@ -868,37 +1737,45 @@ def normalize_gemini_data(
 # =========================================================
 
 @app.get("/")
-def health_check():
+def health_check() -> dict[str, Any]:
     model = (
-        os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
+        os.environ.get(
+            "GEMINI_MODEL",
+            DEFAULT_GEMINI_MODEL,
+        ).strip()
         or DEFAULT_GEMINI_MODEL
     )
 
     return {
         "status": "ok",
         "service": "ShwayGo Engine API",
-        "version": "3.1.0",
+        "version": "4.0.0",
+        "architecture": "original_plus_ai",
         "gemini_api": "interactions_v1beta",
         "gemini_model": model,
     }
 
 
 @app.post("/scrape")
-def scrape(request: ScrapeRequest):
+def scrape(request: ScrapeRequest) -> dict[str, Any]:
+    started_at = time.time()
     product_url = str(request.url)
-
-    gemini_key = os.environ.get(
-        "GEMINI_API_KEY",
-        "",
-    ).strip()
 
     scrapingant_key = os.environ.get(
         "SCRAPINGANT_API_KEY",
         "",
     ).strip()
 
+    gemini_key = os.environ.get(
+        "GEMINI_API_KEY",
+        "",
+    ).strip()
+
     configured_model = (
-        os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
+        os.environ.get(
+            "GEMINI_MODEL",
+            DEFAULT_GEMINI_MODEL,
+        ).strip()
         or DEFAULT_GEMINI_MODEL
     )
 
@@ -908,64 +1785,89 @@ def scrape(request: ScrapeRequest):
         )
 
     try:
-        raw_html = fetch_supplier_html(
-            product_url=product_url,
-            scrapingant_key=scrapingant_key,
+        html = fetch_supplier_html(
+            product_url,
+            scrapingant_key,
         )
-
     except Exception as exc:
         return error_response(
             "Supplier page extraction failed.",
             details=str(exc)[:1500],
+            elapsed_seconds=round(
+                time.time() - started_at,
+                2,
+            ),
         )
-
-    original_title = extract_title_from_html(raw_html)
-    original_images = extract_images_from_html(raw_html)
-
-    if not gemini_key:
-        fallback = build_fallback_data(raw_html)
-
-        return success_response(
-            data=fallback,
-            source="fallback_no_gemini_key",
-            product_url=product_url,
-            gemini_model=configured_model,
-        )
-
-    prompt = build_gemini_prompt(
-        raw_html=raw_html,
-        original_title=original_title,
-        original_images=original_images,
-    )
 
     try:
-        gemini_data, model_used = call_gemini(
-            api_key=gemini_key,
-            prompt=prompt,
+        original = extract_original_product(html)
+    except Exception as exc:
+        return error_response(
+            "Original product parsing failed.",
+            details=str(exc)[:1500],
+            elapsed_seconds=round(
+                time.time() - started_at,
+                2,
+            ),
         )
 
-        final_data = normalize_gemini_data(
-            gemini_data=gemini_data,
-            original_title=original_title,
-            extracted_images=original_images,
+    if not gemini_key:
+        ai = fallback_ai_data(original)
+
+        return success_response(
+            product_url=product_url,
+            original=original,
+            ai=ai,
+            source="original_only_no_gemini_key",
+            gemini_model=configured_model,
+            elapsed_seconds=round(
+                time.time() - started_at,
+                2,
+            ),
+        )
+
+    try:
+        raw_ai, model_used = call_gemini(
+            gemini_key,
+            original,
+        )
+        ai = normalize_ai_data(
+            raw_ai,
+            normalize_text(original.get("name")),
         )
 
         return success_response(
-            data=final_data,
-            source="gemini",
             product_url=product_url,
+            original=original,
+            ai=ai,
+            source="original_plus_gemini",
             gemini_model=model_used,
             gemini_api="interactions_v1beta",
+            original_json_blobs_found=safe_int(
+                original.get("json_blobs_found")
+            ),
+            elapsed_seconds=round(
+                time.time() - started_at,
+                2,
+            ),
         )
 
     except Exception as exc:
-        fallback = build_fallback_data(raw_html)
+        ai = fallback_ai_data(original)
 
         return success_response(
-            data=fallback,
-            source="fallback_gemini_failed",
             product_url=product_url,
+            original=original,
+            ai=ai,
+            source="original_plus_ai_fallback",
             gemini_model=configured_model,
             gemini_api="interactions_v1beta",
             gemini_error=str(exc)[:1500],
+            original_json_blobs_found=safe_int(
+                original.get("json_blobs_found")
+            ),
+            elapsed_seconds=round(
+                time.time() - started_at,
+                2,
+            ),
         )
