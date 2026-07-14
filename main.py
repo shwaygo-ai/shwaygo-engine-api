@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import re
@@ -18,7 +19,7 @@ from pydantic import BaseModel, HttpUrl
 
 app = FastAPI(
     title="ShwayGo Engine API",
-    version="4.2.0",
+    version="4.3.0",
 )
 
 app.add_middleware(
@@ -44,7 +45,7 @@ MAX_VIDEOS = 10
 MAX_REVIEWS = 20
 MAX_SPECS = 80
 MAX_JSON_BLOBS = 80
-REQUEST_TIMEOUT_SCRAPER = 120
+REQUEST_TIMEOUT_SCRAPER = 180
 REQUEST_TIMEOUT_GEMINI = 150
 
 
@@ -2233,19 +2234,100 @@ def fallback_ai_data(
 # SCRAPINGANT
 # =========================================================
 
+def build_scrapingant_js_snippet() -> str:
+    """Return Base64-encoded JavaScript for interactive page loading."""
+    script = r"""
+(async () => {
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const labels = [
+    "show more", "see more", "view more", "more details",
+    "specifications", "product details", "customer reviews",
+    "reviews", "buyer questions", "questions & answers",
+    "عرض المزيد", "المزيد", "المواصفات", "تفاصيل المنتج",
+    "تقييمات العملاء", "التقييمات", "المراجعات",
+    "أسئلة وأجابات المشتري", "أسئلة وأجوبة المشتري"
+  ];
+  const blocked = [
+    "buy now", "add to cart", "checkout", "purchase",
+    "اشتري الآن", "أضف إلى السلة", "الدفع"
+  ];
+  const textOf = (el) => ((el.innerText || el.textContent || "")
+    .replace(/\s+/g, " ").trim().toLowerCase());
+  const clickInfo = async () => {
+    const items = Array.from(document.querySelectorAll(
+      "button,[role='button'],a,summary,[aria-expanded='false']"
+    ));
+    for (const el of items) {
+      const text = textOf(el);
+      if (!text || text.length > 160) continue;
+      if (blocked.some(x => text.includes(x))) continue;
+      if (!labels.some(x => text.includes(x))) continue;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      if (r.width < 2 || r.height < 2 || s.display === "none" || s.visibility === "hidden") continue;
+      try {
+        el.scrollIntoView({block:"center",behavior:"auto"});
+        el.click();
+        await sleep(450);
+      } catch (_) {}
+    }
+  };
+  await sleep(2500);
+  let h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+  for (let i = 0; i <= 12; i++) {
+    scrollTo(0, Math.floor(h * i / 12));
+    await sleep(650);
+    if ([3,7,10].includes(i)) await clickInfo();
+  }
+  await clickInfo();
+  await sleep(1800);
+  h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+  for (let i = 0; i <= 8; i++) {
+    scrollTo(0, Math.floor(h * i / 8));
+    await sleep(500);
+  }
+  await clickInfo();
+  await sleep(1800);
+  scrollTo(0, 0);
+  await sleep(500);
+  return {title: document.title, height: h, textLength: document.body ? document.body.innerText.length : 0};
+})();
+""".strip()
+    return base64.b64encode(script.encode('utf-8')).decode('ascii')
+
+
 def fetch_supplier_html(
     product_url: str,
     scrapingant_key: str,
 ) -> str:
+    endpoint = "https://api.scrapingant.com/v2/general"
     response = requests.get(
-        "https://api.scrapingant.com/v2/general",
+        endpoint,
         params={
             "url": product_url,
             "x-api-key": scrapingant_key,
             "browser": "true",
+            "wait_for_selector": "body",
+            "js_snippet": build_scrapingant_js_snippet(),
         },
         timeout=REQUEST_TIMEOUT_SCRAPER,
     )
+
+    if response.status_code != 200:
+        print(
+            "SCRAPINGANT ADVANCED REQUEST FAILED:",
+            response.status_code,
+            response.text[:700],
+        )
+        response = requests.get(
+            endpoint,
+            params={
+                "url": product_url,
+                "x-api-key": scrapingant_key,
+                "browser": "true",
+            },
+            timeout=REQUEST_TIMEOUT_SCRAPER,
+        )
 
     html = response.text
 
@@ -2261,7 +2343,6 @@ def fetch_supplier_html(
         )
 
     lowered = html.lower()
-
     service_error_terms = (
         "zenrows web scraping api",
         "trial expired",
@@ -2300,6 +2381,8 @@ def fetch_supplier_html(
                     "color" in lowered
                     or "colour" in lowered
                 ),
+                "has_arabic_specs": "المواصفات" in html,
+                "has_arabic_reviews": "تقييمات العملاء" in html,
             },
         )
         print("HTML START:", html[:3000])
@@ -2502,8 +2585,9 @@ def health_check() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "ShwayGo Engine API",
-        "version": "4.2.0",
+        "version": "4.3.0",
         "architecture": "original_plus_ai",
+        "collection_mode": "scrapingant_interactive_browser",
         "gemini_api": "interactions_v1beta",
         "gemini_model": model,
     }
