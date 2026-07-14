@@ -18,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 
 app = FastAPI(
     title="ShwayGo Engine API",
-    version="4.1.0",
+    version="4.2.0",
 )
 
 app.add_middleware(
@@ -717,6 +717,489 @@ def extract_visible_reviews(text: str) -> list[str]:
     return unique_strings(reviews, MAX_REVIEWS)
 
 
+
+# =========================================================
+# ALIEXPRESS DEEP SOURCE EXTRACTION
+# =========================================================
+
+def decode_source_text(value: str) -> str:
+    """Decode common escaping used in inline AliExpress state objects."""
+    decoded = unescape(value)
+    replacements = {
+        r"\/": "/",
+        r"\u002F": "/",
+        r"\u002f": "/",
+        r"\u003A": ":",
+        r"\u003a": ":",
+        r"\u0026": "&",
+        r"\u003D": "=",
+        r"\u003d": "=",
+        r"\u0022": '"',
+        r"\u0027": "'",
+        r"\x2F": "/",
+    }
+    for old, new in replacements.items():
+        decoded = decoded.replace(old, new)
+    return decoded
+
+
+def recursive_decode_json_strings(
+    value: Any,
+    depth: int = 0,
+) -> Any:
+    """Decode JSON strings that themselves contain JSON objects or arrays."""
+    if depth > 5:
+        return value
+
+    if isinstance(value, dict):
+        return {
+            key: recursive_decode_json_strings(child, depth + 1)
+            for key, child in value.items()
+        }
+
+    if isinstance(value, list):
+        return [
+            recursive_decode_json_strings(child, depth + 1)
+            for child in value
+        ]
+
+    if isinstance(value, str):
+        candidate = decode_source_text(value).strip()
+
+        if (
+            len(candidate) >= 2
+            and candidate[0] in "[{"
+            and candidate[-1] in "]}"
+        ):
+            try:
+                parsed = json.loads(candidate)
+                return recursive_decode_json_strings(
+                    parsed,
+                    depth + 1,
+                )
+            except json.JSONDecodeError:
+                return candidate
+
+        return candidate
+
+    return value
+
+
+def extract_json_ld_blobs(html: str) -> list[Any]:
+    blobs: list[Any] = []
+
+    pattern = re.compile(
+        r'<script\b[^>]*type=["\']application/ld\+json["\'][^>]*>'
+        r'(.*?)</script>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in pattern.finditer(html):
+        parsed = parse_json_text(
+            decode_source_text(match.group(1))
+        )
+
+        if parsed is not None:
+            blobs.append(
+                recursive_decode_json_strings(parsed)
+            )
+
+    return blobs
+
+
+def extract_marker_json_blobs(html: str) -> list[Any]:
+    """
+    Scan the whole source around common AliExpress state/module markers.
+    This catches objects embedded outside straightforward JSON script tags.
+    """
+    decoded_html = decode_source_text(html)
+    blobs: list[Any] = []
+    seen: set[str] = set()
+
+    markers = (
+        "window.runParams",
+        "runParams",
+        "__INITIAL_STATE__",
+        "__PRELOADED_STATE__",
+        "__APOLLO_STATE__",
+        "pageData",
+        "productInfoComponent",
+        "productPropComponent",
+        "productSkuComponent",
+        "skuModule",
+        "skuPropertyList",
+        "skuPropertyValues",
+        "productReview",
+        "feedbackComponent",
+        "titleModule",
+        "imageModule",
+        "specificationModule",
+        "productDetail",
+        "productData",
+        "dataLayer",
+    )
+
+    for marker_name in markers:
+        start_search = 0
+
+        while True:
+            marker_index = decoded_html.find(
+                marker_name,
+                start_search,
+            )
+
+            if marker_index == -1:
+                break
+
+            search_end = min(
+                len(decoded_html),
+                marker_index + 1_500_000,
+            )
+
+            brace_positions = [
+                pos
+                for pos in (
+                    decoded_html.find("{", marker_index, search_end),
+                    decoded_html.find("[", marker_index, search_end),
+                )
+                if pos != -1
+            ]
+
+            if brace_positions:
+                start = min(brace_positions)
+                candidate = balanced_json_slice(
+                    decoded_html,
+                    start,
+                )
+
+                if candidate:
+                    signature = (
+                        candidate[:250]
+                        + str(len(candidate))
+                    )
+
+                    if signature not in seen:
+                        parsed = parse_json_text(candidate)
+
+                        if parsed is not None:
+                            parsed = recursive_decode_json_strings(
+                                parsed
+                            )
+                            seen.add(signature)
+                            blobs.append(parsed)
+
+                            if len(blobs) >= 150:
+                                return blobs
+
+            start_search = marker_index + len(marker_name)
+
+    return blobs
+
+
+def extract_all_json_blobs(html: str) -> list[Any]:
+    combined = (
+        extract_json_blobs(html)
+        + extract_json_ld_blobs(html)
+        + extract_marker_json_blobs(html)
+    )
+
+    result: list[Any] = []
+    signatures: set[str] = set()
+
+    for blob in combined:
+        try:
+            signature = json.dumps(
+                blob,
+                ensure_ascii=False,
+                sort_keys=True,
+            )[:1000]
+        except (TypeError, ValueError):
+            signature = repr(blob)[:1000]
+
+        if signature in signatures:
+            continue
+
+        signatures.add(signature)
+        result.append(blob)
+
+    return result
+
+
+def raw_source_matches(
+    html: str,
+    patterns: tuple[str, ...],
+) -> list[str]:
+    source = decode_source_text(html)
+    values: list[str] = []
+
+    for pattern in patterns:
+        matches = re.findall(
+            pattern,
+            source,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        for match in matches:
+            if isinstance(match, tuple):
+                match = next(
+                    (
+                        item
+                        for item in match
+                        if item
+                    ),
+                    "",
+                )
+
+            value = normalize_text(match)
+
+            if value:
+                values.append(value)
+
+    return unique_strings(values)
+
+
+def extract_raw_rating(html: str) -> float:
+    values = raw_source_matches(
+        html,
+        (
+            r'"ratingValue"\s*:\s*"?(\d+(?:\.\d+)?)',
+            r'"averageStar"\s*:\s*"?(\d+(?:\.\d+)?)',
+            r'"averageRating"\s*:\s*"?(\d+(?:\.\d+)?)',
+            r'"evaluationAverage"\s*:\s*"?(\d+(?:\.\d+)?)',
+            r'"star"\s*:\s*"?(\d+(?:\.\d+)?)',
+            r'"rating"\s*:\s*"?(\d+(?:\.\d+)?)',
+            r'(\d+(?:\.\d+)?)\s*(?:out\s+of\s+5|/5)',
+        ),
+    )
+
+    ratings = [
+        safe_rating(value)
+        for value in values
+        if 1.0 <= safe_rating(value) <= 5.0
+    ]
+
+    return max(ratings) if ratings else 0.0
+
+
+def extract_raw_review_count(html: str) -> int:
+    values = raw_source_matches(
+        html,
+        (
+            r'"reviewCount"\s*:\s*"?(\d+)',
+            r'"feedbackCount"\s*:\s*"?(\d+)',
+            r'"evaluationCount"\s*:\s*"?(\d+)',
+            r'"totalReviews"\s*:\s*"?(\d+)',
+            r'"totalReviewCount"\s*:\s*"?(\d+)',
+            r'(\d+)\s*(?:reviews?|ratings?|تقييمات|مراجعات)',
+        ),
+    )
+
+    counts = [
+        safe_int(value)
+        for value in values
+        if safe_int(value) > 0
+    ]
+
+    return max(counts) if counts else 0
+
+
+def extract_raw_sales_count(html: str) -> int:
+    values = raw_source_matches(
+        html,
+        (
+            r'"tradeCount"\s*:\s*"?(\d+)',
+            r'"formatTradeCount"\s*:\s*"[^"\d]*(\d+)',
+            r'"orders"\s*:\s*"?(\d+)',
+            r'"soldCount"\s*:\s*"?(\d+)',
+            r'(\d+)\s*(?:sold|مباع|تم\s*بيعه)',
+        ),
+    )
+
+    counts = [
+        safe_int(value)
+        for value in values
+        if safe_int(value) > 0
+    ]
+
+    return max(counts) if counts else 0
+
+
+def extract_raw_option_groups(
+    html: str,
+) -> dict[str, list[str]]:
+    """
+    Extract SKU option groups directly from escaped or unescaped source.
+    """
+    source = decode_source_text(html)
+    groups: dict[str, list[str]] = {}
+
+    group_pattern = re.compile(
+        r'"(?:skuPropertyName|propertyName|propName|attributeName)"'
+        r'\s*:\s*"([^"]+)"'
+        r'.{0,25000}?'
+        r'"(?:skuPropertyValues|propertyValues|values|options)"'
+        r'\s*:\s*(\[[\s\S]*?\])',
+        flags=re.IGNORECASE,
+    )
+
+    for match in group_pattern.finditer(source):
+        group_name = normalize_text(match.group(1))
+        raw_list = match.group(2)
+        parsed = parse_json_text(raw_list)
+        values: list[str] = []
+
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, str):
+                    values.append(item)
+                    continue
+
+                if not isinstance(item, dict):
+                    continue
+
+                for key in OPTION_VALUE_KEYS:
+                    if key in item:
+                        values.append(item.get(key))
+                        break
+
+        if group_name and values:
+            groups.setdefault(group_name, [])
+            groups[group_name] = unique_strings(
+                groups[group_name] + values,
+                50,
+            )
+
+    # Independent fallback for common AliExpress SKU display-name fields.
+    fallback_values = raw_source_matches(
+        source,
+        (
+            r'"(?:propertyValueDisplayName|skuPropertyValueDisplayName|'
+            r'propertyValueName|displayName)"\s*:\s*"([^"]+)"',
+        ),
+    )
+
+    if fallback_values and not groups:
+        size_values = [
+            value.upper()
+            for value in fallback_values
+            if value.upper() in {
+                "XXXS", "XXS", "XS", "S", "M", "L",
+                "XL", "XXL", "XXXL", "4XL", "5XL", "6XL",
+                "ONE SIZE",
+            }
+        ]
+        other_values = [
+            value
+            for value in fallback_values
+            if value.upper() not in set(size_values)
+            and len(value) <= 80
+        ]
+
+        if size_values:
+            groups["Size"] = unique_strings(size_values)
+
+        if other_values:
+            groups["Color"] = unique_strings(
+                other_values,
+                30,
+            )
+
+    return groups
+
+
+def extract_raw_specs(html: str) -> dict[str, str]:
+    source = decode_source_text(html)
+    specs: dict[str, str] = {}
+
+    pair_patterns = (
+        (
+            r'"(?:attrName|attributeName|propName|propertyName|specName|'
+            r'key|label)"\s*:\s*"([^"]+)"'
+            r'.{0,1500}?'
+            r'"(?:attrValue|attributeValue|propValue|propertyValue|'
+            r'specValue|value|text)"\s*:\s*"([^"]+)"'
+        ),
+        (
+            r'"(?:name|title)"\s*:\s*"([^"]+)"'
+            r'.{0,800}?'
+            r'"(?:value|text)"\s*:\s*"([^"]+)"'
+        ),
+    )
+
+    for pattern in pair_patterns:
+        for key, value in re.findall(
+            pattern,
+            source,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            key_text = normalize_text(key)
+            value_text = normalize_text(value)
+
+            if (
+                key_text
+                and value_text
+                and key_text.casefold() != value_text.casefold()
+                and len(key_text) <= 100
+                and len(value_text) <= 500
+            ):
+                specs.setdefault(key_text, value_text)
+
+            if len(specs) >= MAX_SPECS:
+                return specs
+
+    return specs
+
+
+def extract_raw_reviews(html: str) -> list[str]:
+    values = raw_source_matches(
+        html,
+        (
+            r'"(?:buyerFeedback|feedbackContent|reviewContent|'
+            r'evaluationContent|comment|content)"\s*:\s*"([^"]{10,1500})"',
+        ),
+    )
+
+    blocked_terms = (
+        "javascript",
+        "stylesheet",
+        "alicdn",
+        "http://",
+        "https://",
+    )
+
+    reviews = [
+        value
+        for value in values
+        if not any(
+            term in value.lower()
+            for term in blocked_terms
+        )
+    ]
+
+    return unique_strings(reviews, MAX_REVIEWS)
+
+
+def merge_option_groups(
+    *group_sets: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    merged: dict[str, list[str]] = {}
+
+    for groups in group_sets:
+        for key, values in groups.items():
+            clean_key = normalize_text(key)
+
+            if not clean_key:
+                continue
+
+            merged.setdefault(clean_key, [])
+            merged[clean_key] = unique_strings(
+                merged[clean_key] + values,
+                50,
+            )
+
+    return merged
+
+
 # =========================================================
 # ORIGINAL PRODUCT EXTRACTION
 # =========================================================
@@ -1250,36 +1733,72 @@ def extract_named_spec(
 def extract_original_product(
     html: str,
 ) -> dict[str, Any]:
-    blobs = extract_json_blobs(html)
+    blobs = extract_all_json_blobs(html)
     walked = all_walked(blobs)
     visible_text = html_to_visible_text(html)
 
-    option_groups = extract_option_groups(walked)
-    json_colors, json_sizes = classify_option_groups(option_groups)
+    json_option_groups = extract_option_groups(walked)
+    raw_option_groups = extract_raw_option_groups(html)
+    option_groups = merge_option_groups(
+        json_option_groups,
+        raw_option_groups,
+    )
 
+    json_colors, json_sizes = classify_option_groups(
+        option_groups
+    )
     visible_colors = extract_visible_colors(visible_text)
     visible_sizes = extract_visible_sizes(visible_text)
 
-    colors = unique_strings(json_colors + visible_colors, 30)
-    sizes = unique_strings(json_sizes + visible_sizes, 30)
+    colors = unique_strings(
+        json_colors + visible_colors,
+        30,
+    )
+    sizes = unique_strings(
+        json_sizes + visible_sizes,
+        30,
+    )
 
     specs = extract_specs(walked, colors, sizes)
-    visible_specs = extract_visible_specifications(visible_text)
+
+    raw_specs = extract_raw_specs(html)
+    for key, value in raw_specs.items():
+        specs.setdefault(key, value)
+
+    visible_specs = extract_visible_specifications(
+        visible_text
+    )
     for key, value in visible_specs.items():
         specs.setdefault(key, value)
 
-    json_rating = extract_rating(html, walked)
-    visible_rating = extract_visible_rating(visible_text)
-    rating = json_rating if json_rating > 0 else visible_rating
+    if colors:
+        specs.setdefault("Colors", ", ".join(colors))
 
-    json_review_count = extract_review_count(html, walked)
-    visible_review_count = extract_visible_review_count(visible_text)
-    review_count = max(json_review_count, visible_review_count)
+    if sizes:
+        specs.setdefault("Sizes", ", ".join(sizes))
 
-    json_reviews = extract_reviews(walked)
-    visible_reviews = extract_visible_reviews(visible_text)
+    rating_candidates = [
+        extract_rating(html, walked),
+        extract_raw_rating(html),
+        extract_visible_rating(visible_text),
+    ]
+    rating = max(rating_candidates)
+
+    review_count = max(
+        extract_review_count(html, walked),
+        extract_raw_review_count(html),
+        extract_visible_review_count(visible_text),
+    )
+
+    sales_count = max(
+        extract_raw_sales_count(html),
+        extract_visible_sales_count(visible_text),
+    )
+
     reviews = unique_strings(
-        json_reviews + visible_reviews,
+        extract_reviews(walked)
+        + extract_raw_reviews(html)
+        + extract_visible_reviews(visible_text),
         MAX_REVIEWS,
     )
 
@@ -1319,7 +1838,7 @@ def extract_original_product(
         ),
         "rating": rating,
         "review_count": review_count,
-        "sales_count": extract_visible_sales_count(visible_text),
+        "sales_count": sales_count,
         "reviews": reviews,
         "images": extract_images(html, walked),
         "videos": extract_videos(html, walked),
@@ -1983,7 +2502,7 @@ def health_check() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "ShwayGo Engine API",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "architecture": "original_plus_ai",
         "gemini_api": "interactions_v1beta",
         "gemini_model": model,
