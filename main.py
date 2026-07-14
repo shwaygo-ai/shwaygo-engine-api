@@ -18,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 
 app = FastAPI(
     title="ShwayGo Engine API",
-    version="4.0.0",
+    version="4.1.0",
 )
 
 app.add_middleware(
@@ -510,6 +510,211 @@ def all_walked(blobs: list[Any]) -> list[tuple[tuple[str, ...], Any]]:
         walked.extend(walk_json(blob))
 
     return walked
+
+
+
+def html_to_visible_text(html: str) -> str:
+    """Best-effort conversion of rendered HTML into searchable visible text."""
+    cleaned = re.sub(
+        r"<script\b[^>]*>.*?</script>",
+        " ",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    cleaned = re.sub(
+        r"<style\b[^>]*>.*?</style>",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    cleaned = re.sub(r"<!--.*?-->", " ", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"<[^>]+>", "\n", cleaned)
+    cleaned = unescape(cleaned)
+    cleaned = cleaned.replace("\\u002F", "/")
+    cleaned = re.sub(r"[\t\r\f\v]+", " ", cleaned)
+    cleaned = re.sub(r"[ ]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+    return cleaned.strip()
+
+
+def find_first_match(
+    patterns: tuple[str, ...],
+    text: str,
+    flags: int = re.IGNORECASE,
+) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=flags)
+        if match:
+            return normalize_text(match.group(1))
+    return ""
+
+
+def extract_visible_rating(text: str) -> float:
+    patterns = (
+        r"(?:تقييم|rating)\s*[:|]?\s*(\d(?:[.,]\d+)?)",
+        r"(\d(?:[.,]\d+)?)\s*(?:من\s*5|out\s+of\s+5|/5)",
+        r"(?:⭐|★|☆)\s*(\d(?:[.,]\d+)?)",
+    )
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            rating = safe_rating(match)
+            if 1.0 <= rating <= 5.0:
+                return rating
+    return 0.0
+
+
+def extract_visible_review_count(text: str) -> int:
+    patterns = (
+        r"(?:تقييمات\s*العملاء|التقييمات|reviews?|ratings?)\s*[\(\[]?\s*(\d+)",
+        r"(\d+)\s*(?:تقييمات|مراجعات|reviews?|ratings?)",
+    )
+    values: list[int] = []
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            value = safe_int(match)
+            if value > 0:
+                values.append(value)
+    return max(values) if values else 0
+
+
+def extract_visible_sales_count(text: str) -> int:
+    patterns = (
+        r"(\d+)\s*(?:مباع|تم\s*بيعه|sold)",
+        r"(?:مبيعات|sales?)\s*[:|]?\s*(\d+)",
+    )
+    values: list[int] = []
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            value = safe_int(match)
+            if value > 0:
+                values.append(value)
+    return max(values) if values else 0
+
+
+def extract_visible_sizes(text: str) -> list[str]:
+    candidates: list[str] = []
+
+    # Explicit size area values.
+    size_patterns = (
+        r"(?:المقاس|مقاس|size)\s*[:：]?\s*([^\n]{1,120})",
+        r"(ONE\s+SIZE)",
+    )
+    for pattern in size_patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            candidates.extend(re.split(r"[,/|،\s]+", normalize_text(match)))
+
+    # Standard apparel sizes anywhere in rendered DOM.
+    candidates.extend(
+        re.findall(
+            r"(?<![A-Za-z0-9])(?:XXXS|XXS|XS|S|M|L|XL|XXL|XXXL|4XL|5XL|6XL)(?![A-Za-z0-9])",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    normalized: list[str] = []
+    for item in candidates:
+        item = normalize_text(item).upper()
+        if item == "ONE":
+            continue
+        if item in {
+            "XXXS", "XXS", "XS", "S", "M", "L",
+            "XL", "XXL", "XXXL", "4XL", "5XL", "6XL",
+            "ONE SIZE",
+        }:
+            normalized.append(item)
+
+    return unique_strings(normalized, 20)
+
+
+def extract_visible_colors(text: str) -> list[str]:
+    patterns = (
+        r"(?:اللون|لون|color|colour)\s*[:：]?\s*([^\n]{1,100})",
+    )
+    candidates: list[str] = []
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            value = normalize_text(match)
+            # Stop at likely next UI label.
+            value = re.split(
+                r"(?:المقاس|مقاس|size|السعر|price|الشحن|shipping)",
+                value,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0]
+            candidates.extend(re.split(r"[,/|،]+", value))
+
+    blocked = {
+        "color", "colour", "لون", "اللون",
+        "default", "افتراضي", "اختيار", "select",
+    }
+    cleaned = []
+    for item in candidates:
+        item = normalize_text(item)
+        if 1 <= len(item) <= 60 and item.casefold() not in blocked:
+            cleaned.append(item)
+    return unique_strings(cleaned, 20)
+
+
+def extract_visible_specifications(text: str) -> dict[str, str]:
+    """Extract label/value pairs from AliExpress rendered specification text."""
+    specs: dict[str, str] = {}
+    lines = [normalize_text(line) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+
+    heading_indexes = [
+        i for i, line in enumerate(lines)
+        if line.casefold() in {"المواصفات", "specifications", "specification"}
+    ]
+    if not heading_indexes:
+        return specs
+
+    start = heading_indexes[0] + 1
+    end = min(len(lines), start + 120)
+    section = lines[start:end]
+
+    stop_terms = {
+        "نظرة عامة", "overview", "تقييمات العملاء",
+        "customer reviews", "ربما تحب أيضًا", "you may also like",
+        "أسئلة وأجابات المشتري", "buyer questions and answers",
+    }
+
+    filtered: list[str] = []
+    for line in section:
+        if line.casefold() in {term.casefold() for term in stop_terms}:
+            break
+        if line in {"عرض المزيد", "Show more", "show more"}:
+            continue
+        if len(line) > 180:
+            continue
+        filtered.append(line)
+
+    # AliExpress often renders alternating label/value cells.
+    for i in range(0, len(filtered) - 1, 2):
+        left = filtered[i]
+        right = filtered[i + 1]
+        if (
+            left and right
+            and left.casefold() != right.casefold()
+            and len(left) <= 100
+            and len(right) <= 180
+        ):
+            specs.setdefault(left, right)
+
+    return specs
+
+
+def extract_visible_reviews(text: str) -> list[str]:
+    reviews: list[str] = []
+    patterns = (
+        r"(?:وفقًا للوصف|as described|very good|good quality|excellent)[^\n]{0,300}",
+    )
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            value = normalize_text(match)
+            if len(value) >= 8:
+                reviews.append(value)
+    return unique_strings(reviews, MAX_REVIEWS)
 
 
 # =========================================================
@@ -1047,9 +1252,36 @@ def extract_original_product(
 ) -> dict[str, Any]:
     blobs = extract_json_blobs(html)
     walked = all_walked(blobs)
+    visible_text = html_to_visible_text(html)
+
     option_groups = extract_option_groups(walked)
-    colors, sizes = classify_option_groups(option_groups)
+    json_colors, json_sizes = classify_option_groups(option_groups)
+
+    visible_colors = extract_visible_colors(visible_text)
+    visible_sizes = extract_visible_sizes(visible_text)
+
+    colors = unique_strings(json_colors + visible_colors, 30)
+    sizes = unique_strings(json_sizes + visible_sizes, 30)
+
     specs = extract_specs(walked, colors, sizes)
+    visible_specs = extract_visible_specifications(visible_text)
+    for key, value in visible_specs.items():
+        specs.setdefault(key, value)
+
+    json_rating = extract_rating(html, walked)
+    visible_rating = extract_visible_rating(visible_text)
+    rating = json_rating if json_rating > 0 else visible_rating
+
+    json_review_count = extract_review_count(html, walked)
+    visible_review_count = extract_visible_review_count(visible_text)
+    review_count = max(json_review_count, visible_review_count)
+
+    json_reviews = extract_reviews(walked)
+    visible_reviews = extract_visible_reviews(visible_text)
+    reviews = unique_strings(
+        json_reviews + visible_reviews,
+        MAX_REVIEWS,
+    )
 
     product = {
         "name": extract_original_name(html, walked),
@@ -1064,6 +1296,7 @@ def extract_original_product(
                 "fabric",
                 "composition",
                 "الخامة",
+                "نوع القماش",
             ),
         ),
         "brand": extract_named_spec(
@@ -1084,12 +1317,10 @@ def extract_original_product(
                 "المنشأ",
             ),
         ),
-        "rating": extract_rating(html, walked),
-        "review_count": extract_review_count(
-            html,
-            walked,
-        ),
-        "reviews": extract_reviews(walked),
+        "rating": rating,
+        "review_count": review_count,
+        "sales_count": extract_visible_sales_count(visible_text),
+        "reviews": reviews,
         "images": extract_images(html, walked),
         "videos": extract_videos(html, walked),
         "option_groups": option_groups,
@@ -1654,6 +1885,9 @@ def success_response(
             "review_count": safe_int(
                 original.get("review_count")
             ),
+            "sales_count": safe_int(
+                original.get("sales_count")
+            ),
             "reviews": (
                 original.get("reviews")
                 if isinstance(original.get("reviews"), list)
@@ -1749,7 +1983,7 @@ def health_check() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "ShwayGo Engine API",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "architecture": "original_plus_ai",
         "gemini_api": "interactions_v1beta",
         "gemini_model": model,
